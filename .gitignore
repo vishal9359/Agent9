@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Output files
+*.docx
+*.json
+*.png
+output/
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Mermaid temp files
+temp_*.txt
+temp_*.mmd
+mermaid_converter/temp_*
+mermaid_converter/*.png
+mermaid_converter/node_modules/
