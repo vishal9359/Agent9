@@ -28,6 +28,18 @@ Validation failed: Missing Start or End node
 
 **Fix:** Better LLM prompt with explicit instructions + validation with retry feedback.
 
+### 4. ❌ Unlabeled Nodes → ✅ FIXED
+**Issue:**
+```
+flowchart TD
+n1 --> n2  (nodes without descriptive labels)
+```
+
+**Fix:** 
+- Enhanced LLM prompt to require ALL nodes have descriptive labels
+- Added validation to detect unlabeled nodes
+- Now generates: `n1[Check condition] --> n2[Process result]`
+
 ---
 
 ## 🚀 Quick Start
@@ -102,6 +114,7 @@ For your `memory_checker.cpp`:
 | Unicode handling | ❌ Crashes | ✅ Stripped |
 | Empty flowcharts | ❌ Common | ✅ Fixed |
 | Missing nodes | ❌ Frequent | ✅ Validated |
+| Node labeling | ❌ Unlabeled nodes | ✅ All nodes labeled |
 | Error messages | ❌ Generic | ✅ Specific |
 | Retry logic | ❌ No feedback | ✅ With feedback |
 | LLM config | ❌ Too random | ✅ Optimized |

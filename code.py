@@ -275,6 +275,28 @@ def validate_mermaid_syntax(mermaid_content):
     if len(lines) < 3:
         return False, f"Too few lines in flowchart: {len(lines)}"
 
+    # Check for unlabeled nodes
+    unlabeled_nodes = []
+    for line in lines:
+        if "flowchart" in line.lower():
+            continue
+        # Check for nodes without labels (e.g., "n1 -->" or "n1 {{" or "--> n1")
+        # Valid nodes should have labels like: n1[label] or n1{{label}}
+        # Find node references that aren't followed by [ or {{
+        import re
+        # Pattern: node ID followed by --> or |label| without [ or {{ before
+        pattern = r'\b(n\d+|Start|End)\b(?!\[)(?!\{)(?!\()'
+        matches = re.findall(pattern, line)
+        for match in matches:
+            if match not in ['Start', 'End'] and '-->' in line:
+                # Check if this node ID appears with a label elsewhere in content
+                label_check = f"{match}[" in mermaid_content or f"{match}{{{{" in mermaid_content
+                if not label_check and match not in unlabeled_nodes:
+                    unlabeled_nodes.append(match)
+    
+    if unlabeled_nodes:
+        return False, f"Nodes without labels: {', '.join(unlabeled_nodes[:3])}"
+
     return True, None
 
 
@@ -333,48 +355,66 @@ def generate_flowchart(function_content, function_name):
         "1. Output ONLY pure ASCII text - NO Unicode, NO special characters, NO emojis\n"
         "2. Output ONLY the Mermaid flowchart code - NO explanations, NO comments\n"
         "3. Start with: flowchart TD\n"
-        "4. Use simple node IDs: n1, n2, n3, etc.\n\n"
+        "4. Use simple node IDs: n1, n2, n3, etc.\n"
+        "5. EVERY node MUST have a descriptive label - NO unlabeled nodes allowed\n\n"
         "FLOWCHART REQUIREMENTS:\n"
         "1. Must have exactly ONE Start node: Start((Start))\n"
         "2. Must have exactly ONE End node: End((End))\n"
-        "3. All paths must eventually lead to End\n\n"
+        "3. All paths must eventually lead to End\n"
+        "4. EVERY node ID (n1, n2, n3, etc.) MUST be defined with a label\n\n"
+        "NODE LABELING - CRITICAL:\n"
+        "- Process nodes: n1[Clear description of action]\n"
+        "- Decision nodes: n2{{Clear condition being checked}}\n"
+        "- NEVER use: n1 --> n2  (WRONG - n2 has no label)\n"
+        "- ALWAYS use: n1[Action] --> n2[Next action]  (CORRECT - both labeled)\n"
+        "- Each node label should describe what happens in that step\n\n"
         "NODE SHAPES - Use ONLY these:\n"
         "- Start/End: Start((Start)) and End((End))\n"
-        "- Process: n1[Process description]\n"
-        "- Decision: n2{{Condition}}\n\n"
-        "CONTROL FLOW MAPPING:\n"
+        "- Process: n1[Initialize variables] or n2[Call function X] or n3[Set value to Y]\n"
+        "- Decision: n4{{Check if X greater than Y}} or n5{{Loop condition met}}\n\n"
+        "CONTROL FLOW MAPPING WITH PROPER LABELS:\n"
         "1. Map every if/else statement:\n"
-        "   n1{{condition}} --> |true| n2[action]\n"
-        "   n1 --> |false| n3[else action]\n\n"
+        "   n1{{Check if condition is true}} --> |true| n2[Execute true block]\n"
+        "   n1 --> |false| n3[Execute else block]\n\n"
         "2. Map every loop (for/while/do-while):\n"
-        "   n1[Initialize] --> n2{{Loop condition}}\n"
-        "   n2 --> |true| n3[Loop body]\n"
+        "   n1[Initialize loop variable] --> n2{{Check loop condition}}\n"
+        "   n2 --> |true| n3[Execute loop body]\n"
         "   n3 --> n2\n"
-        "   n2 --> |false| n4[After loop]\n\n"
+        "   n2 --> |false| n4[Continue after loop]\n\n"
         "3. Map every switch statement:\n"
-        "   n1{{switch variable}} --> |case1| n2[action1]\n"
-        "   n1 --> |case2| n3[action2]\n"
-        "   n1 --> |default| n4[default action]\n\n"
+        "   n1{{Evaluate switch variable}} --> |case1| n2[Handle case 1]\n"
+        "   n1 --> |case2| n3[Handle case 2]\n"
+        "   n1 --> |default| n4[Handle default case]\n\n"
         f"4. Function calls detected: {function_calls_str}\n"
-        "   Show each as: n1[Call functionName]\n"
+        "   Show each as: n1[Call functionName with parameters]\n"
         "   Do NOT show the internal code of called functions\n\n"
         "5. Map return statements:\n"
-        "   n1[Return value] --> End((End))\n\n"
-        "LABEL RULES:\n"
-        "- Keep labels short and clear\n"
+        "   n1[Return result value] --> End((End))\n\n"
+        "LABEL CONTENT RULES:\n"
+        "- Describe the actual code statement or operation\n"
+        "- Be specific but concise (3-8 words)\n"
         "- Use plain English words\n"
         "- NO parentheses in labels (except for Start/End)\n"
         "- NO special operators like <, >, ==, != in labels\n"
-        "- Instead write: \"less than\", \"greater than\", \"equals\", \"not equal\"\n\n"
-        "EXAMPLE FORMAT:\n"
+        "- Instead write: \"less than\", \"greater than\", \"equals\", \"not equal\"\n"
+        "- Example: Instead of 'if (x > 5)' write 'Check if x greater than 5'\n\n"
+        "EXAMPLE FORMAT (NOTICE ALL NODES HAVE LABELS):\n"
         "flowchart TD\n"
-        "Start((Start)) --> n1[Initialize]\n"
-        "n1 --> n2{{Check condition}}\n"
-        "n2 --> |true| n3[Do something]\n"
-        "n2 --> |false| n4[Do other thing]\n"
-        "n3 --> End((End))\n"
+        "Start((Start)) --> n1[Initialize counter to zero]\n"
+        "n1 --> n2{{Check if counter less than limit}}\n"
+        "n2 --> |true| n3[Increment counter]\n"
+        "n2 --> |false| n4[Exit loop]\n"
+        "n3 --> n5[Process current item]\n"
+        "n5 --> n2\n"
         "n4 --> End((End))\n\n"
-        "FUNCTION CODE:\n{function}\n\nOUTPUT (Mermaid flowchart only, no explanations):"
+        "BAD EXAMPLE (DO NOT DO THIS):\n"
+        "n1 --> n2  (WRONG - n2 has no label)\n"
+        "n1 --> |true| n2  (WRONG - n2 has no label)\n\n"
+        "GOOD EXAMPLE (DO THIS):\n"
+        "n1[Check value] --> n2[Process result]  (CORRECT)\n"
+        "n1{{Condition}} --> |true| n2[Handle true case]  (CORRECT)\n\n"
+        "FUNCTION CODE:\n{function}\n\n"
+        "OUTPUT (Mermaid flowchart only, no explanations, ALL nodes must have labels):"
     )
 
     print(f"\nGenerating flowchart for function: {function_name}")
