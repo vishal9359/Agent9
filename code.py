@@ -275,27 +275,31 @@ def validate_mermaid_syntax(mermaid_content):
     if len(lines) < 3:
         return False, f"Too few lines in flowchart: {len(lines)}"
 
-    # Check for unlabeled nodes
-    unlabeled_nodes = []
+    # Check for unlabeled nodes - improved logic
+    import re
+    defined_nodes = set()
+    used_nodes = set()
+    
     for line in lines:
         if "flowchart" in line.lower():
             continue
-        # Check for nodes without labels (e.g., "n1 -->" or "n1 {{" or "--> n1")
-        # Valid nodes should have labels like: n1[label] or n1{{label}}
-        # Find node references that aren't followed by [ or {{
-        import re
-        # Pattern: node ID followed by --> or |label| without [ or {{ before
-        pattern = r'\b(n\d+|Start|End)\b(?!\[)(?!\{)(?!\()'
-        matches = re.findall(pattern, line)
-        for match in matches:
-            if match not in ['Start', 'End'] and '-->' in line:
-                # Check if this node ID appears with a label elsewhere in content
-                label_check = f"{match}[" in mermaid_content or f"{match}{{{{" in mermaid_content
-                if not label_check and match not in unlabeled_nodes:
-                    unlabeled_nodes.append(match)
+            
+        # Find node definitions (nodes with labels)
+        # Pattern: n1[...] or n2{{...}} or Start((...)) or End((...))
+        defs = re.findall(r'\b(n\d+|Start|End)[\[\{(]', line)
+        defined_nodes.update(defs)
+        
+        # Find node references in arrows
+        # Pattern: --> n1 or n1 --> (but not n1[)
+        refs = re.findall(r'(?:-->|--)\s*(n\d+)\s*(?:$|-->|--|\|)', line)
+        used_nodes.update(refs)
     
-    if unlabeled_nodes:
-        return False, f"Nodes without labels: {', '.join(unlabeled_nodes[:3])}"
+    # Find nodes that are used but not defined
+    unlabeled = used_nodes - defined_nodes
+    unlabeled = [n for n in unlabeled if n not in ['Start', 'End']]
+    
+    if unlabeled:
+        return False, f"Nodes used without labels: {', '.join(sorted(unlabeled)[:3])}. Each node must be defined with a label like n1[Description]"
 
     return True, None
 
@@ -361,7 +365,9 @@ def generate_flowchart(function_content, function_name):
         "1. Must have exactly ONE Start node: Start((Start))\n"
         "2. Must have exactly ONE End node: End((End))\n"
         "3. All paths must eventually lead to End\n"
-        "4. EVERY node ID (n1, n2, n3, etc.) MUST be defined with a label\n\n"
+        "4. EVERY node ID (n1, n2, n3, etc.) MUST be defined with a label\n"
+        "5. Even simple functions need proper flowchart structure\n"
+        "6. Minimum 3 nodes: Start, at least one labeled action/decision, End\n\n"
         "NODE LABELING - CRITICAL:\n"
         "- Process nodes: n1[Clear description of action]\n"
         "- Decision nodes: n2{{Clear condition being checked}}\n"
@@ -407,6 +413,14 @@ def generate_flowchart(function_content, function_name):
         "n3 --> n5[Process current item]\n"
         "n5 --> n2\n"
         "n4 --> End((End))\n\n"
+        "SIMPLE FUNCTION EXAMPLE (Even simple functions need proper labels):\n"
+        "For a constructor that just initializes a variable:\n"
+        "flowchart TD\n"
+        "Start((Start)) --> n1[Set size variable to input value]\n"
+        "n1 --> n2{{Check if flag is enabled}}\n"
+        "n2 --> |true| n3[Call backtrace function]\n"
+        "n2 --> |false| End((End))\n"
+        "n3 --> End((End))\n\n"
         "BAD EXAMPLE (DO NOT DO THIS):\n"
         "n1 --> n2  (WRONG - n2 has no label)\n"
         "n1 --> |true| n2  (WRONG - n2 has no label)\n\n"
@@ -450,8 +464,17 @@ def generate_flowchart(function_content, function_name):
                 last_error = "Flowchart became empty after sanitization"
                 print(f"Attempt {retries + 1}: {last_error}")
                 print(f"  Raw length: {len(raw_content)}, Extracted length: {len(extracted_content)}")
-                retries += 1
-                continue
+                print(f"  Extracted content preview: {extracted_content[:200]}")
+                # If extraction worked but sanitization failed, try with minimal sanitization
+                if len(extracted_content) > 20:
+                    # Try just cleaning unicode without full sanitization
+                    sanitized_content = clean_unicode_chars(extracted_content)
+                    if not sanitized_content or len(sanitized_content.strip()) == 0:
+                        retries += 1
+                        continue
+                else:
+                    retries += 1
+                    continue
 
             is_valid, error_msg = validate_mermaid_syntax(sanitized_content)
             
