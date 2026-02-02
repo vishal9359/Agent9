@@ -1,8 +1,3 @@
-"""
-C++ Function Flowchart Generator - Improved Version 2.0
-Fixes Unicode errors, empty flowcharts, and validation issues
-"""
-
 import os
 import json
 import subprocess
@@ -21,13 +16,7 @@ file_index_map = {}
 SUPPORTED_EXT = (".c", ".cpp", ".cc", ".cxx")
 
 # Configure LLM with optimized settings
-llm = ChatOllama(
-    model="gpt-oss", 
-    temperature=0.3, 
-    top_k=10, 
-    top_p=0.9,
-    timeout=60  # 60 second timeout for LLM responses
-)
+llm = ChatOllama(model="gpt-oss", temperature=0.3, top_k=10, top_p=0.9)
 
 # Configure paths - UPDATE THESE FOR YOUR ENVIRONMENT
 mermaid_path = "/home/workspace/mermaid_converter"
@@ -157,16 +146,6 @@ def sanitize_flowchart_content(flowchart_content):
     if not flowchart_content:
         return ""
     
-    import re
-    
-    # Fix single braces to double braces for decision nodes
-    # Pattern: n1{text} should be n1{{text}}
-    flowchart_content = re.sub(r'(n\d+)\{([^}]+)\}(?!\})', r'\1{{\2}}', flowchart_content)
-    
-    # Ensure spaces around arrows
-    flowchart_content = re.sub(r'(\w)\s*-->\s*', r'\1 --> ', flowchart_content)
-    flowchart_content = re.sub(r'\s*--\s*', r' -- ', flowchart_content)
-    
     flowchart_list = flowchart_content.split("\n")
     new_list = []
     flowchart_started = False
@@ -177,6 +156,7 @@ def sanitize_flowchart_content(flowchart_content):
         # Start capturing when we see flowchart declaration
         if ("flowchart td" in line_lower or "flowchart lr" in line_lower) and not flowchart_started:
             flowchart_started = True
+            # Normalize to flowchart TD
             if "flowchart lr" in line_lower:
                 new_list.append("flowchart LR")
             else:
@@ -245,19 +225,23 @@ def sanitize_flowchart_content(flowchart_content):
         # Handle brackets in labels
         processed_line = replace_brackets_in_brackets(processed_line)
         
-        # Replace operators in ALL contexts (not just decision nodes)
-        # This is more aggressive to prevent any operator from causing issues
-        processed_line = (
-            processed_line
-            .replace("==", " equal ")
-            .replace("!=", " not equal ")
-            .replace(">=", " gte ")
-            .replace("<=", " lte ")
-            .replace(" > ", " gt ")
-            .replace(" < ", " lt ")
-            .replace("&&", " and ")
-            .replace("||", " or ")
-        )
+        # Replace comparison operators in decision nodes
+        if "{{" in processed_line and "}}" in processed_line:
+            start_idx = processed_line.find("{{")
+            end_idx = processed_line.find("}}", start_idx)
+            if start_idx != -1 and end_idx != -1:
+                condition = processed_line[start_idx+2:end_idx]
+                condition = (
+                    condition.replace("!=", " not equal ")
+                    .replace("==", " equal ")
+                    .replace(">=", " gte ")
+                    .replace("<=", " lte ")
+                    .replace(">", " gt ")
+                    .replace("<", " lt ")
+                    .replace("&&", " and ")
+                    .replace("||", " or ")
+                )
+                processed_line = processed_line[:start_idx+2] + condition + processed_line[end_idx:]
         
         new_list.append(processed_line)
 
@@ -285,42 +269,31 @@ def validate_mermaid_syntax(mermaid_content):
     lines = [l.strip() for l in mermaid_content.split("\n") if l.strip()]
     if len(lines) < 3:
         return False, f"Too few lines in flowchart: {len(lines)}"
-
-    import re
     
-    # Check for single braces (should be double)
-    if re.search(r'n\d+\{[^{]', mermaid_content):
-        return False, "Decision nodes must use double braces like n1{{Condition}} not n1{Condition}"
-    
-    # Check for operators in labels
-    problematic_ops = ['==', '!=', '()', '>=', '<=']
-    for line in lines:
-        for op in problematic_ops:
-            if op in line and 'flowchart' not in line.lower():
-                return False, f"Labels must not contain operators like {op}. Use words: 'equals', 'not equal', etc."
-    
-    # Check for unlabeled nodes
+    # Check for unlabeled nodes - nodes used without definition
     defined_nodes = set()
     used_nodes = set()
     
     for line in lines:
         if "flowchart" in line.lower():
             continue
-            
-        # Find node definitions (nodes with labels)
-        defs = re.findall(r'\b(n\d+|Start|End)[\[\{(]', line)
-        defined_nodes.update(defs)
         
-        # Find node references in arrows
-        refs = re.findall(r'(?:-->|--)\s*(n\d+)\s*(?:$|-->|--|\|)', line)
-        used_nodes.update(refs)
+        # Find defined nodes (with labels): n1[...] or n2{{...}}
+        defined = re.findall(r'\b(n\d+)\s*[\[\{]', line)
+        defined_nodes.update(defined)
+        
+        # Find used nodes in arrows: --> n1 or n1 -->
+        used = re.findall(r'(?:-->|--)\s+(n\d+)(?:\s|$|-->|--|\|)', line)
+        used_nodes.update(used)
+        # Also check nodes before arrows
+        used_before = re.findall(r'\b(n\d+)\s+(?:-->|--)', line)
+        used_nodes.update(used_before)
     
-    # Find nodes that are used but not defined
+    # Nodes that are used but never defined
     unlabeled = used_nodes - defined_nodes
-    unlabeled = [n for n in unlabeled if n not in ['Start', 'End']]
     
     if unlabeled:
-        return False, f"Nodes without labels: {', '.join(sorted(unlabeled)[:3])}. Use n1[Description] format"
+        return False, f"Nodes used without labels: {', '.join(sorted(list(unlabeled))[:5])}. All nodes must have labels like n1[Description] or n2{{{{Condition}}}}"
 
     return True, None
 
@@ -368,92 +341,86 @@ def generate_function_description(function_content):
         return "Description generation failed"
 
 
-def get_short_prompt(function_content, function_calls_str):
-    """Shorter prompt for complex/long functions"""
-    return (
-        "Create a Mermaid flowchart for this C++ function.\n\n"
-        "STRICT RULES:\n"
-        "1. Format: flowchart TD\n"
-        "2. Start: Start((Start))  End: End((End))\n"
-        "3. Process nodes: n1[Description]  (square brackets)\n"
-        "4. Decision nodes: n2{{{{Condition}}}}  (DOUBLE curly braces)\n"
-        "5. Labels: NO operators, NO parentheses, use words only\n"
-        "   - Bad: n1[check x > 5]  Good: n1[Check if x greater than 5]\n"
-        "   - Bad: n1{{condition}}  Good: n1{{{{Condition in words}}}}\n"
-        f"6. Function calls found: {function_calls_str}\n\n"
-        "Example:\n"
-        "flowchart TD\n"
-        "Start((Start)) --> n1[Initialize variable]\n"
-        "n1 --> n2{{{{Check if value equals zero}}}}\n"
-        "n2 --> |true| n3[Set flag]\n"
-        "n2 --> |false| n4[Return error]\n"
-        "n3 --> End((End))\n"
-        "n4 --> End((End))\n\n"
-        "Code:\n{{function}}\n\nFlowchart:"
-    )
-
-
 def generate_flowchart(function_content, function_name):
     """Generate flowchart for a function with validation and retry mechanism"""
     function_calls = extract_function_calls(function_content)
-    function_calls_str = ", ".join(function_calls[:5]) if function_calls else "none"
+    function_calls_str = ", ".join(function_calls[:10]) if function_calls else "none detected"
     
-    # Limit function content for very long functions
-    max_lines = 100
-    if len(function_content) > max_lines:
-        print(f"  Note: Function has {len(function_content)} lines, using first {max_lines} for analysis")
-        function_content_limited = function_content[:max_lines]
-    else:
-        function_content_limited = function_content
-    
+    # IMPORTANT: Double curly braces {{{{ }}}} in f-string become {{ }} in output
     flowchart_prompt = (
-        "Create a Mermaid flowchart for this C++ function.\n\n"
-        "CRITICAL RULES:\n"
-        "1. Format: flowchart TD\n"
-        "2. Start: Start((Start))  End: End((End))\n"
-        "3. Process nodes: n1[Action description]  (square brackets)\n"
-        "4. Decision nodes: n2{{{{Condition}}}}  (DOUBLE curly braces)\n"
-        "5. Labels in plain English - NO operators, NO parentheses:\n"
-        "   - WRONG: n1[if (x > 5)]  RIGHT: n1{{{{Check if x greater than 5}}}}\n"
-        "   - WRONG: n1{{cond}}  RIGHT: n1{{{{Condition description}}}}\n"
-        "   - WRONG: n1[x == y]  RIGHT: n1{{{{Check if x equals y}}}}\n"
-        "6. Space before/after arrows: n1 --> n2  (not n1-->n2)\n"
-        f"7. Function calls: {function_calls_str}\n\n"
-        "Control flow patterns:\n"
-        "- If/else: n1{{{{Condition in words}}}} --> |true| n2[True action]\n"
-        "           n1 --> |false| n3[False action]\n"
-        "- Loop: n1[Initialize] --> n2{{{{Loop condition in words}}}}\n"
-        "        n2 --> |true| n3[Loop body] --> n2\n"
-        "        n2 --> |false| n4[After loop]\n"
-        "- Return: n1[Return value] --> End((End))\n\n"
-        "Example:\n"
+        "You are an expert C++ code analyzer that creates Mermaid flowcharts.\n\n"
+        "TASK: Create a Mermaid flowchart for the C++ function below.\n\n"
+        "CRITICAL OUTPUT RULES:\n"
+        "1. Output ONLY pure ASCII text - NO Unicode, NO special characters, NO emojis\n"
+        "2. Output ONLY the Mermaid flowchart code - NO explanations, NO comments\n"
+        "3. Start with: flowchart TD\n"
+        "4. Use simple node IDs: n1, n2, n3, etc.\n"
+        "5. EVERY SINGLE NODE MUST HAVE A DESCRIPTIVE LABEL\n\n"
+        "FLOWCHART REQUIREMENTS:\n"
+        "1. Must have exactly ONE Start node: Start((Start))\n"
+        "2. Must have exactly ONE End node: End((End))\n"
+        "3. All paths must eventually lead to End\n"
+        "4. MANDATORY: Every node ID must be defined with brackets or braces\n\n"
+        "NODE LABELING (MANDATORY - NO EXCEPTIONS):\n"
+        "- Process nodes MUST use square brackets: n1[Description of action]\n"
+        "- Decision nodes MUST use double curly braces: n2{{{{Condition to check}}}}\n"
+        "- WRONG: Start((Start)) --> n1  (n1 has no label!)\n"
+        "- RIGHT: Start((Start)) --> n1[Initialize variable]\n"
+        "- WRONG: n1 --> n2  (n2 has no label!)\n"
+        "- RIGHT: n1[First action] --> n2[Second action]\n"
+        "- WRONG: n1 --> |true| n2  (n2 has no label!)\n"
+        "- RIGHT: n1{{{{Condition}}}} --> |true| n2[True action]\n\n"
+        "NODE SHAPES:\n"
+        "- Start/End: Start((Start)) and End((End))\n"
+        "- Process: n1[Initialize] or n2[Call functionX] or n3[Set value]\n"
+        "- Decision: n4{{{{Check condition}}}} or n5{{{{Loop check}}}}\n\n"
+        "CONTROL FLOW PATTERNS:\n"
+        "1. If/else - BOTH nodes must have labels:\n"
+        "   n1{{{{Check condition}}}} --> |true| n2[Execute if block]\n"
+        "   n1 --> |false| n3[Execute else block]\n\n"
+        "2. Loop - ALL nodes must have labels:\n"
+        "   n1[Initialize counter] --> n2{{{{Check counter less than limit}}}}\n"
+        "   n2 --> |true| n3[Execute loop body]\n"
+        "   n3 --> n4[Increment counter]\n"
+        "   n4 --> n2\n"
+        "   n2 --> |false| n5[Exit loop]\n\n"
+        "3. Switch - ALL cases must have labels:\n"
+        "   n1{{{{Evaluate switch variable}}}} --> |case1| n2[Handle case 1]\n"
+        "   n1 --> |case2| n3[Handle case 2]\n"
+        "   n1 --> |default| n4[Handle default]\n\n"
+        f"4. Function calls detected: {function_calls_str}\n"
+        "   Show as: n1[Call functionName]\n\n"
+        "5. Return statements:\n"
+        "   n1[Return value] --> End((End))\n\n"
+        "LABEL CONTENT RULES:\n"
+        "- Describe the actual code operation (not the syntax)\n"
+        "- Use 3-8 words\n"
+        "- Plain English only\n"
+        "- NO operators: Replace < > == != with words\n"
+        "- NO parentheses in labels\n\n"
+        "COMPLETE EXAMPLE:\n"
         "flowchart TD\n"
-        "Start((Start)) --> n1[Set counter to zero]\n"
-        "n1 --> n2{{{{Check if counter less than limit}}}}\n"
-        "n2 --> |true| n3[Process item]\n"
-        "n2 --> |false| End((End))\n"
-        "n3 --> End((End))\n\n"
-        "Code:\n{{function}}\n\nFlowchart:"
+        "Start((Start)) --> n1[Check if input is valid]\n"
+        "n1 --> n2{{{{Validate input not null}}}}\n"
+        "n2 --> |true| n3[Process the input data]\n"
+        "n2 --> |false| n4[Return error code]\n"
+        "n3 --> n5[Store result in variable]\n"
+        "n5 --> End((End))\n"
+        "n4 --> End((End))\n\n"
+        "FUNCTION CODE:\n"
+        "{function}\n\n"
+        "OUTPUT (Mermaid flowchart ONLY, ensure ALL nodes have labels):"
     )
 
-    print(f"\nGenerating flowchart for function: {function_name} ({len(function_content)} lines)")
-    query = flowchart_prompt.format(function="\n".join(function_content_limited))
+    print(f"\nGenerating flowchart for function: {function_name}")
+    query = flowchart_prompt.format(function="\n".join(function_content))
     
     retries = 0
     max_retries = 5
     last_error = None
-    use_short_prompt = False
 
     while retries < max_retries:
         try:
-            # After 2 failed attempts with main prompt, try shorter prompt
-            if retries == 2 and not use_short_prompt:
-                print(f"  Switching to simplified prompt...")
-                query = get_short_prompt(function_content_limited, function_calls_str).format(
-                    function="\n".join(function_content_limited[:60])  # Even more limited
-                )
-                use_short_prompt = True
-            
             messages = [HumanMessage(query)]
             flowchart_response = llm.invoke(messages)
             raw_content = flowchart_response.content
@@ -461,12 +428,6 @@ def generate_flowchart(function_content, function_name):
             if not raw_content or len(raw_content.strip()) == 0:
                 last_error = "LLM returned empty response"
                 print(f"Attempt {retries + 1}: {last_error}")
-                # Try reducing function size further
-                if len(function_content_limited) > 30:
-                    function_content_limited = function_content_limited[:len(function_content_limited)//2]
-                    query = (get_short_prompt(function_content_limited, function_calls_str) if use_short_prompt 
-                            else flowchart_prompt).format(function="\n".join(function_content_limited))
-                    print(f"  Reducing function size to {len(function_content_limited)} lines")
                 retries += 1
                 continue
 
@@ -483,7 +444,6 @@ def generate_flowchart(function_content, function_name):
             if not sanitized_content or len(sanitized_content.strip()) == 0:
                 last_error = "Flowchart became empty after sanitization"
                 print(f"Attempt {retries + 1}: {last_error}")
-                print(f"  Raw length: {len(raw_content)}, Extracted length: {len(extracted_content)}")
                 retries += 1
                 continue
 
@@ -493,7 +453,8 @@ def generate_flowchart(function_content, function_name):
                 last_error = f"Validation failed: {error_msg}"
                 print(f"Attempt {retries + 1}: {last_error}")
                 retries += 1
-                query = flowchart_prompt + f"\n\nPREVIOUS ATTEMPT FAILED: {error_msg}\nPlease fix this issue."
+                # Add specific feedback to help LLM fix the issue
+                query = flowchart_prompt + f"\n\nPREVIOUS ATTEMPT FAILED: {error_msg}\nPlease fix this issue and ensure ALL nodes have proper labels."
                 continue
 
             # Try to generate image
