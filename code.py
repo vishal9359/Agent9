@@ -21,7 +21,13 @@ file_index_map = {}
 SUPPORTED_EXT = (".c", ".cpp", ".cc", ".cxx")
 
 # Configure LLM with optimized settings
-llm = ChatOllama(model="gpt-oss", temperature=0.3, top_k=10, top_p=0.9)
+llm = ChatOllama(
+    model="gpt-oss", 
+    temperature=0.3, 
+    top_k=10, 
+    top_p=0.9,
+    timeout=60  # 60 second timeout for LLM responses
+)
 
 # Configure paths - UPDATE THESE FOR YOUR ENVIRONMENT
 mermaid_path = "/home/workspace/mermaid_converter"
@@ -347,99 +353,88 @@ def generate_function_description(function_content):
         return "Description generation failed"
 
 
+def get_short_prompt(function_content, function_calls_str):
+    """Shorter prompt for complex/long functions"""
+    return (
+        "Create a Mermaid flowchart for this C++ function.\n\n"
+        "RULES:\n"
+        "1. Start with: flowchart TD\n"
+        "2. Begin: Start((Start))\n"
+        "3. End: End((End))\n"
+        "4. Every node needs a label: n1[Action description] or n2{{Condition}}\n"
+        "5. NO unlabeled nodes like 'n1 -->' - must be 'n1[Description] -->'\n"
+        f"6. Function calls: {function_calls_str}\n\n"
+        "Format:\n"
+        "flowchart TD\n"
+        "Start((Start)) --> n1[First action]\n"
+        "n1 --> n2{{Check condition}}\n"
+        "n2 --> |true| n3[True action]\n"
+        "n2 --> |false| n4[False action]\n"
+        "n3 --> End((End))\n"
+        "n4 --> End((End))\n\n"
+        "Function:\n{function}\n\n"
+        "Output flowchart only:"
+    )
+
+
 def generate_flowchart(function_content, function_name):
     """Generate flowchart for a function with validation and retry mechanism"""
     function_calls = extract_function_calls(function_content)
-    function_calls_str = ", ".join(function_calls[:10]) if function_calls else "none detected"
+    function_calls_str = ", ".join(function_calls[:5]) if function_calls else "none"
+    
+    # Limit function content for very long functions
+    max_lines = 100
+    if len(function_content) > max_lines:
+        print(f"  Note: Function has {len(function_content)} lines, using first {max_lines} for analysis")
+        function_content_limited = function_content[:max_lines]
+    else:
+        function_content_limited = function_content
     
     flowchart_prompt = (
-        "You are an expert C++ code analyzer that creates Mermaid flowcharts.\n\n"
-        "TASK: Create a Mermaid flowchart for the C++ function below.\n\n"
-        "CRITICAL OUTPUT RULES:\n"
-        "1. Output ONLY pure ASCII text - NO Unicode, NO special characters, NO emojis\n"
-        "2. Output ONLY the Mermaid flowchart code - NO explanations, NO comments\n"
-        "3. Start with: flowchart TD\n"
-        "4. Use simple node IDs: n1, n2, n3, etc.\n"
-        "5. EVERY node MUST have a descriptive label - NO unlabeled nodes allowed\n\n"
-        "FLOWCHART REQUIREMENTS:\n"
-        "1. Must have exactly ONE Start node: Start((Start))\n"
-        "2. Must have exactly ONE End node: End((End))\n"
-        "3. All paths must eventually lead to End\n"
-        "4. EVERY node ID (n1, n2, n3, etc.) MUST be defined with a label\n"
-        "5. Even simple functions need proper flowchart structure\n"
-        "6. Minimum 3 nodes: Start, at least one labeled action/decision, End\n\n"
-        "NODE LABELING - CRITICAL:\n"
-        "- Process nodes: n1[Clear description of action]\n"
-        "- Decision nodes: n2{{Clear condition being checked}}\n"
-        "- NEVER use: n1 --> n2  (WRONG - n2 has no label)\n"
-        "- ALWAYS use: n1[Action] --> n2[Next action]  (CORRECT - both labeled)\n"
-        "- Each node label should describe what happens in that step\n\n"
-        "NODE SHAPES - Use ONLY these:\n"
-        "- Start/End: Start((Start)) and End((End))\n"
-        "- Process: n1[Initialize variables] or n2[Call function X] or n3[Set value to Y]\n"
-        "- Decision: n4{{Check if X greater than Y}} or n5{{Loop condition met}}\n\n"
-        "CONTROL FLOW MAPPING WITH PROPER LABELS:\n"
-        "1. Map every if/else statement:\n"
-        "   n1{{Check if condition is true}} --> |true| n2[Execute true block]\n"
-        "   n1 --> |false| n3[Execute else block]\n\n"
-        "2. Map every loop (for/while/do-while):\n"
-        "   n1[Initialize loop variable] --> n2{{Check loop condition}}\n"
-        "   n2 --> |true| n3[Execute loop body]\n"
-        "   n3 --> n2\n"
-        "   n2 --> |false| n4[Continue after loop]\n\n"
-        "3. Map every switch statement:\n"
-        "   n1{{Evaluate switch variable}} --> |case1| n2[Handle case 1]\n"
-        "   n1 --> |case2| n3[Handle case 2]\n"
-        "   n1 --> |default| n4[Handle default case]\n\n"
-        f"4. Function calls detected: {function_calls_str}\n"
-        "   Show each as: n1[Call functionName with parameters]\n"
-        "   Do NOT show the internal code of called functions\n\n"
-        "5. Map return statements:\n"
-        "   n1[Return result value] --> End((End))\n\n"
-        "LABEL CONTENT RULES:\n"
-        "- Describe the actual code statement or operation\n"
-        "- Be specific but concise (3-8 words)\n"
-        "- Use plain English words\n"
-        "- NO parentheses in labels (except for Start/End)\n"
-        "- NO special operators like <, >, ==, != in labels\n"
-        "- Instead write: \"less than\", \"greater than\", \"equals\", \"not equal\"\n"
-        "- Example: Instead of 'if (x > 5)' write 'Check if x greater than 5'\n\n"
-        "EXAMPLE FORMAT (NOTICE ALL NODES HAVE LABELS):\n"
+        "Create a Mermaid flowchart for this C++ function.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Output format: flowchart TD\n"
+        "2. Start node: Start((Start))\n"
+        "3. End node: End((End))\n"
+        "4. EVERY node MUST have a label:\n"
+        "   - Process: n1[Action description]\n"
+        "   - Decision: n2{{Condition}}\n"
+        "5. NO unlabeled nodes (n1 --> is WRONG, must be n1[Label] -->)\n"
+        f"6. Function calls: {function_calls_str}\n\n"
+        "Map control flow:\n"
+        "- if/else: n1{{Condition}} --> |true| n2[Action] / |false| n3[Else action]\n"
+        "- loops: n1[Init] --> n2{{Loop condition}} --> |true| n3[Body] --> n2 / |false| n4[After]\n"
+        "- switch: n1{{Switch var}} --> |case1| n2[Action1] / |case2| n3[Action2]\n"
+        "- return: n1[Return value] --> End((End))\n\n"
+        "Example:\n"
         "flowchart TD\n"
-        "Start((Start)) --> n1[Initialize counter to zero]\n"
-        "n1 --> n2{{Check if counter less than limit}}\n"
-        "n2 --> |true| n3[Increment counter]\n"
-        "n2 --> |false| n4[Exit loop]\n"
-        "n3 --> n5[Process current item]\n"
-        "n5 --> n2\n"
-        "n4 --> End((End))\n\n"
-        "SIMPLE FUNCTION EXAMPLE (Even simple functions need proper labels):\n"
-        "For a constructor that just initializes a variable:\n"
-        "flowchart TD\n"
-        "Start((Start)) --> n1[Set size variable to input value]\n"
-        "n1 --> n2{{Check if flag is enabled}}\n"
-        "n2 --> |true| n3[Call backtrace function]\n"
+        "Start((Start)) --> n1[Initialize]\n"
+        "n1 --> n2{{Check condition}}\n"
+        "n2 --> |true| n3[Do action]\n"
         "n2 --> |false| End((End))\n"
         "n3 --> End((End))\n\n"
-        "BAD EXAMPLE (DO NOT DO THIS):\n"
-        "n1 --> n2  (WRONG - n2 has no label)\n"
-        "n1 --> |true| n2  (WRONG - n2 has no label)\n\n"
-        "GOOD EXAMPLE (DO THIS):\n"
-        "n1[Check value] --> n2[Process result]  (CORRECT)\n"
-        "n1{{Condition}} --> |true| n2[Handle true case]  (CORRECT)\n\n"
-        "FUNCTION CODE:\n{function}\n\n"
-        "OUTPUT (Mermaid flowchart only, no explanations, ALL nodes must have labels):"
+        "Function:\n{function}\n\n"
+        "Output (flowchart only, ASCII, all nodes labeled):"
     )
 
-    print(f"\nGenerating flowchart for function: {function_name}")
-    query = flowchart_prompt.format(function="\n".join(function_content))
+    print(f"\nGenerating flowchart for function: {function_name} ({len(function_content)} lines)")
+    query = flowchart_prompt.format(function="\n".join(function_content_limited))
     
     retries = 0
     max_retries = 5
     last_error = None
+    use_short_prompt = False
 
     while retries < max_retries:
         try:
+            # After 2 failed attempts with main prompt, try shorter prompt
+            if retries == 2 and not use_short_prompt:
+                print(f"  Switching to simplified prompt...")
+                query = get_short_prompt(function_content_limited, function_calls_str).format(
+                    function="\n".join(function_content_limited[:60])  # Even more limited
+                )
+                use_short_prompt = True
+            
             messages = [HumanMessage(query)]
             flowchart_response = llm.invoke(messages)
             raw_content = flowchart_response.content
@@ -447,6 +442,12 @@ def generate_flowchart(function_content, function_name):
             if not raw_content or len(raw_content.strip()) == 0:
                 last_error = "LLM returned empty response"
                 print(f"Attempt {retries + 1}: {last_error}")
+                # Try reducing function size further
+                if len(function_content_limited) > 30:
+                    function_content_limited = function_content_limited[:len(function_content_limited)//2]
+                    query = (get_short_prompt(function_content_limited, function_calls_str) if use_short_prompt 
+                            else flowchart_prompt).format(function="\n".join(function_content_limited))
+                    print(f"  Reducing function size to {len(function_content_limited)} lines")
                 retries += 1
                 continue
 
