@@ -43,51 +43,194 @@ def clean_unicode_chars(text):
     """Remove or replace Unicode characters with ASCII equivalents"""
     if not text:
         return ""
-    # Remove non-ASCII characters
     ascii_text = text.encode('ascii', 'ignore').decode('ascii')
-    # Remove any remaining problematic characters
     ascii_text = re.sub(r'[^\x20-\x7E\n\r\t]', '', ascii_text)
     return ascii_text
 
 
+def extract_control_flow_structure(function_cursor, file_lines, start_line):
+    """
+    Extract control flow structure from function AST
+    Returns a simplified representation focusing on control flow
+    """
+    control_flow = []
+    
+    def analyze_node(cursor, indent_level=0):
+        """Recursively analyze AST nodes for control flow"""
+        kind = cursor.kind
+        
+        # CONTROL FLOW NODES (always include)
+        if kind == cindex.CursorKind.IF_STMT:
+            # Get condition
+            children = list(cursor.get_children())
+            if len(children) >= 1:
+                cond_start = children[0].extent.start.line
+                cond_end = children[0].extent.end.line
+                condition_text = " ".join(file_lines[cond_start - start_line:cond_end - start_line + 1])
+                control_flow.append({
+                    'type': 'if',
+                    'condition': condition_text.strip(),
+                    'line': cursor.extent.start.line
+                })
+            
+            # Recurse into if and else blocks
+            for child in children[1:]:
+                analyze_node(child, indent_level + 1)
+        
+        elif kind in (cindex.CursorKind.FOR_STMT, cindex.CursorKind.WHILE_STMT, cindex.CursorKind.DO_STMT):
+            loop_type = 'for' if kind == cindex.CursorKind.FOR_STMT else 'while' if kind == cindex.CursorKind.WHILE_STMT else 'do-while'
+            children = list(cursor.get_children())
+            condition_text = ""
+            if children:
+                cond_start = children[0].extent.start.line
+                cond_end = children[0].extent.end.line
+                condition_text = " ".join(file_lines[cond_start - start_line:cond_end - start_line + 1])
+            
+            control_flow.append({
+                'type': 'loop',
+                'loop_type': loop_type,
+                'condition': condition_text.strip(),
+                'line': cursor.extent.start.line
+            })
+            
+            # Recurse into loop body
+            for child in children:
+                analyze_node(child, indent_level + 1)
+        
+        elif kind == cindex.CursorKind.SWITCH_STMT:
+            children = list(cursor.get_children())
+            switch_var = ""
+            if children:
+                switch_var = " ".join(file_lines[children[0].extent.start.line - start_line:children[0].extent.end.line - start_line + 1])
+            
+            control_flow.append({
+                'type': 'switch',
+                'variable': switch_var.strip(),
+                'line': cursor.extent.start.line
+            })
+            
+            # Recurse into cases
+            for child in children[1:]:
+                analyze_node(child, indent_level + 1)
+        
+        elif kind == cindex.CursorKind.CASE_STMT:
+            control_flow.append({
+                'type': 'case',
+                'line': cursor.extent.start.line
+            })
+            for child in cursor.get_children():
+                analyze_node(child, indent_level)
+        
+        elif kind == cindex.CursorKind.DEFAULT_STMT:
+            control_flow.append({
+                'type': 'default',
+                'line': cursor.extent.start.line
+            })
+            for child in cursor.get_children():
+                analyze_node(child, indent_level)
+        
+        elif kind == cindex.CursorKind.RETURN_STMT:
+            control_flow.append({
+                'type': 'return',
+                'line': cursor.extent.start.line
+            })
+        
+        elif kind == cindex.CursorKind.BREAK_STMT:
+            control_flow.append({
+                'type': 'break',
+                'line': cursor.extent.start.line
+            })
+        
+        elif kind == cindex.CursorKind.CONTINUE_STMT:
+            control_flow.append({
+                'type': 'continue',
+                'line': cursor.extent.start.line
+            })
+        
+        elif kind == cindex.CursorKind.CALL_EXPR:
+            # Function calls are important control flow elements
+            ref = cursor.referenced
+            if ref and ref.spelling:
+                control_flow.append({
+                    'type': 'call',
+                    'function': ref.spelling,
+                    'line': cursor.extent.start.line
+                })
+        
+        else:
+            # For other nodes, recurse into children
+            for child in cursor.get_children():
+                analyze_node(child, indent_level)
+    
+    # Start analysis
+    for child in function_cursor.get_children():
+        analyze_node(child, 0)
+    
+    return control_flow
+
+
+def create_control_flow_summary(control_flow, function_lines):
+    """
+    Create a summary of control flow for LLM
+    Groups sequential statements into semantic blocks
+    """
+    if not control_flow:
+        # For functions with no control flow, summarize the entire function
+        return "Sequential function with no branches or loops. Summarize the overall purpose."
+    
+    summary_parts = []
+    summary_parts.append("Control flow structure:")
+    
+    for item in control_flow:
+        if item['type'] == 'if':
+            summary_parts.append(f"  - IF condition at line {item['line']}")
+        elif item['type'] == 'loop':
+            summary_parts.append(f"  - {item['loop_type'].upper()} loop at line {item['line']}")
+        elif item['type'] == 'switch':
+            summary_parts.append(f"  - SWITCH statement at line {item['line']}")
+        elif item['type'] == 'case':
+            summary_parts.append(f"    - CASE at line {item['line']}")
+        elif item['type'] == 'default':
+            summary_parts.append(f"    - DEFAULT at line {item['line']}")
+        elif item['type'] == 'return':
+            summary_parts.append(f"  - RETURN at line {item['line']}")
+        elif item['type'] == 'call':
+            summary_parts.append(f"  - Call {item['function']}() at line {item['line']}")
+    
+    return "\n".join(summary_parts)
+
+
 def extract_flowchart_from_response(response_content):
-    """Extract flowchart code from LLM response, handling various formats"""
+    """Extract flowchart code from LLM response"""
     if not response_content:
         return ""
         
     response_content = response_content.strip()
     
-    # Case 1: Code block with mermaid tag
     if "```mermaid" in response_content:
         parts = response_content.split("```mermaid")
         if len(parts) > 1:
             flowchart = parts[1].split("```")[0].strip()
             return flowchart
     
-    # Case 2: Code block without language tag
     if "```" in response_content:
         parts = response_content.split("```")
         for part in parts:
-            part_lower = part.lower().strip()
-            if "flowchart" in part_lower:
+            if "flowchart" in part.lower():
                 return part.strip()
     
-    # Case 3: Direct flowchart content (no code blocks)
     if "flowchart" in response_content.lower():
         lines = response_content.split("\n")
         flowchart_lines = []
         started = False
         for line in lines:
-            line_stripped = line.strip()
             if "flowchart" in line.lower() and ("td" in line.lower() or "lr" in line.lower()):
                 started = True
             
             if started:
-                # Stop if we hit explanatory text
-                if line_stripped and not any(keyword in line_stripped for keyword in ['-->', '--', '---', '|', '[', '{', '((', '))', 'flowchart']):
-                    # Check if it looks like explanation text (not node definition)
-                    if re.match(r'^[A-Z][a-z]+[:\.]', line_stripped) or line_stripped.startswith(('This', 'The', 'Note', 'Explanation', '* ', '- ')):
-                        break
+                line_stripped = line.strip()
+                if line_stripped and re.match(r'^[A-Z][a-z]+[:\.]', line_stripped):
+                    break
                 flowchart_lines.append(line)
         
         if flowchart_lines:
@@ -97,40 +240,27 @@ def extract_flowchart_from_response(response_content):
 
 
 def replace_brackets_in_brackets(text):
-    """Replace [, ], {, } with ASCII codes if they are inside bracket context"""
+    """Replace nested brackets with HTML entities"""
     result = []
     depth = 0
-    i = 0
 
-    while i < len(text):
-        char = text[i]
-
-        if char == "[" or char == "{":
+    for char in text:
+        if char in "[{":
             if depth == 0:
                 result.append(char)
             else:
-                if char == "[":
-                    result.append("&#91;")
-                elif char == "{":
-                    result.append("&#123;")
+                result.append("&#91;" if char == "[" else "&#123;")
             depth += 1
-
-        elif char == "]" or char == "}":
+        elif char in "]}":
             depth -= 1
             if depth < 0:
                 depth = 0
-
             if depth == 0:
                 result.append(char)
             else:
-                if char == "]":
-                    result.append("&#93;")
-                elif char == "}":
-                    result.append("&#125;")
+                result.append("&#93;" if char == "]" else "&#125;")
         else:
             result.append(char)
-
-        i += 1
 
     return "".join(result)
 
@@ -140,9 +270,7 @@ def sanitize_flowchart_content(flowchart_content):
     if not flowchart_content:
         return ""
     
-    # First, clean unicode characters
     flowchart_content = clean_unicode_chars(flowchart_content)
-    
     if not flowchart_content:
         return ""
     
@@ -153,44 +281,32 @@ def sanitize_flowchart_content(flowchart_content):
     for line in flowchart_list:
         line_lower = line.lower().strip()
         
-        # Start capturing when we see flowchart declaration
         if ("flowchart td" in line_lower or "flowchart lr" in line_lower) and not flowchart_started:
             flowchart_started = True
-            # Normalize to flowchart TD
-            if "flowchart lr" in line_lower:
-                new_list.append("flowchart LR")
-            else:
-                new_list.append("flowchart TD")
+            new_list.append("flowchart LR" if "lr" in line_lower else "flowchart TD")
             continue
 
         if not flowchart_started:
             continue
 
-        # Skip empty lines
         if not line.strip():
             continue
         
-        # Stop if we hit explanatory text or markdown
         if line.strip().startswith(('```', 'Note:', 'Explanation:', '##', '# ', '---')):
             break
 
-        # Process the line
         original_line = line.strip()
         
-        # Skip if it's another flowchart declaration
         if "flowchart" in original_line.lower():
             continue
             
-        # Process the line for Mermaid compatibility
         processed_line = original_line
         
-        # Preserve Start((Start)) and End((End)) patterns
+        # Preserve Start((Start)) and End((End))
         has_start = "((Start))" in processed_line
         has_end = "((End))" in processed_line
         
-        # Replace parentheses except in special patterns
         if not has_start and not has_end:
-            # Replace parentheses in labels but not in arrows
             temp_line = ""
             in_arrow = False
             i = 0
@@ -218,14 +334,11 @@ def sanitize_flowchart_content(flowchart_content):
                 i += 1
             processed_line = temp_line
         
-        # Restore Start and End if they were there
         processed_line = processed_line.replace("&#40;&#40;Start&#41;&#41;", "((Start))")
         processed_line = processed_line.replace("&#40;&#40;End&#41;&#41;", "((End))")
-        
-        # Handle brackets in labels
         processed_line = replace_brackets_in_brackets(processed_line)
         
-        # Replace comparison operators in decision nodes
+        # Replace operators
         if "{{" in processed_line and "}}" in processed_line:
             start_idx = processed_line.find("{{")
             end_idx = processed_line.find("}}", start_idx)
@@ -245,13 +358,12 @@ def sanitize_flowchart_content(flowchart_content):
         
         new_list.append(processed_line)
 
-    result = "\n".join(new_list)
-    return result if result.strip() else ""
+    return "\n".join(new_list) if new_list else ""
 
 
 def validate_mermaid_syntax(mermaid_content):
-    """Validate Mermaid syntax - Returns (is_valid, error_message)"""
-    if not mermaid_content or len(mermaid_content.strip()) == 0:
+    """Validate Mermaid syntax"""
+    if not mermaid_content or not mermaid_content.strip():
         return False, "Empty flowchart content"
 
     if "flowchart" not in mermaid_content.lower():
@@ -264,13 +376,13 @@ def validate_mermaid_syntax(mermaid_content):
         return False, "Missing End node"
 
     if "-->" not in mermaid_content and "--" not in mermaid_content:
-        return False, "No connections found in flowchart"
+        return False, "No connections found"
 
     lines = [l.strip() for l in mermaid_content.split("\n") if l.strip()]
     if len(lines) < 3:
-        return False, f"Too few lines in flowchart: {len(lines)}"
+        return False, f"Too few lines: {len(lines)}"
     
-    # Check for unlabeled nodes - nodes used without definition
+    # Check for unlabeled nodes
     defined_nodes = set()
     used_nodes = set()
     
@@ -278,28 +390,24 @@ def validate_mermaid_syntax(mermaid_content):
         if "flowchart" in line.lower():
             continue
         
-        # Find defined nodes (with labels): n1[...] or n2{{...}}
         defined = re.findall(r'\b(n\d+)\s*[\[\{]', line)
         defined_nodes.update(defined)
         
-        # Find used nodes in arrows: --> n1 or n1 -->
         used = re.findall(r'(?:-->|--)\s+(n\d+)(?:\s|$|-->|--|\|)', line)
         used_nodes.update(used)
-        # Also check nodes before arrows
         used_before = re.findall(r'\b(n\d+)\s+(?:-->|--)', line)
         used_nodes.update(used_before)
     
-    # Nodes that are used but never defined
     unlabeled = used_nodes - defined_nodes
     
     if unlabeled:
-        return False, f"Nodes used without labels: {', '.join(sorted(list(unlabeled))[:5])}. All nodes must have labels like n1[Description] or n2{{{{Condition}}}}"
+        return False, f"Nodes without labels: {', '.join(sorted(list(unlabeled))[:5])}. Use n1[Label] or n2{{{{Condition}}}}"
 
     return True, None
 
 
 def extract_function_calls(function_content):
-    """Extract function calls from the function content"""
+    """Extract function calls from code"""
     function_calls = []
     pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
     matches = re.findall(pattern, "\n".join(function_content))
@@ -307,7 +415,8 @@ def extract_function_calls(function_content):
     keywords = {
         'if', 'while', 'for', 'switch', 'return', 'new', 'delete', 'sizeof',
         'static_cast', 'dynamic_cast', 'const_cast', 'reinterpret_cast',
-        'printf', 'sprintf', 'fprintf', 'assert', 'memset', 'memcpy', 'free', 'malloc'
+        'printf', 'sprintf', 'fprintf', 'assert', 'memset', 'memcpy', 'free', 'malloc',
+        'std', 'cout', 'endl'
     }
     
     seen = set()
@@ -320,7 +429,7 @@ def extract_function_calls(function_content):
 
 
 def generate_function_description(function_content):
-    """Generate description for a function using LLM"""
+    """Generate description using LLM"""
     prompt = (
         "You are a C++ code documentation expert.\n\n"
         "Analyze the following C++ function and provide a clear, concise description.\n"
@@ -334,85 +443,69 @@ def generate_function_description(function_content):
     messages = [HumanMessage(query)]
     
     try:
-        description_response = llm.invoke(messages)
-        return description_response.content.strip()
+        response = llm.invoke(messages)
+        return response.content.strip()
     except Exception as e:
         print(f"Error generating description: {e}")
         return "Description generation failed"
 
 
-def generate_flowchart(function_content, function_name):
-    """Generate flowchart for a function with validation and retry mechanism"""
-    function_calls = extract_function_calls(function_content)
-    function_calls_str = ", ".join(function_calls[:10]) if function_calls else "none detected"
+def generate_flowchart(function_content, function_name, function_cursor=None, file_lines=None, start_line=0):
+    """Generate flowchart focusing on CONTROL FLOW, not every statement"""
     
-    # IMPORTANT: Double curly braces {{{{ }}}} in f-string become {{ }} in output
+    function_calls = extract_function_calls(function_content)
+    function_calls_str = ", ".join(function_calls[:5]) if function_calls else "none"
+    
+    # Extract control flow structure from AST if available
+    if function_cursor and file_lines:
+        control_flow = extract_control_flow_structure(function_cursor, file_lines, start_line)
+        control_summary = create_control_flow_summary(control_flow, function_content)
+    else:
+        control_summary = "Analyze the code to identify control flow"
+    
     flowchart_prompt = (
-        "You are an expert C++ code analyzer that creates Mermaid flowcharts.\n\n"
-        "TASK: Create a Mermaid flowchart for the C++ function below.\n\n"
-        "CRITICAL OUTPUT RULES:\n"
-        "1. Output ONLY pure ASCII text - NO Unicode, NO special characters, NO emojis\n"
-        "2. Output ONLY the Mermaid flowchart code - NO explanations, NO comments\n"
-        "3. Start with: flowchart TD\n"
-        "4. Use simple node IDs: n1, n2, n3, etc.\n"
-        "5. EVERY SINGLE NODE MUST HAVE A DESCRIPTIVE LABEL\n\n"
-        "FLOWCHART REQUIREMENTS:\n"
-        "1. Must have exactly ONE Start node: Start((Start))\n"
-        "2. Must have exactly ONE End node: End((End))\n"
-        "3. All paths must eventually lead to End\n"
-        "4. MANDATORY: Every node ID must be defined with brackets or braces\n\n"
-        "NODE LABELING (MANDATORY - NO EXCEPTIONS):\n"
-        "- Process nodes MUST use square brackets: n1[Description of action]\n"
-        "- Decision nodes MUST use double curly braces: n2{{{{Condition to check}}}}\n"
-        "- WRONG: Start((Start)) --> n1  (n1 has no label!)\n"
-        "- RIGHT: Start((Start)) --> n1[Initialize variable]\n"
-        "- WRONG: n1 --> n2  (n2 has no label!)\n"
-        "- RIGHT: n1[First action] --> n2[Second action]\n"
-        "- WRONG: n1 --> |true| n2  (n2 has no label!)\n"
-        "- RIGHT: n1{{{{Condition}}}} --> |true| n2[True action]\n\n"
-        "NODE SHAPES:\n"
-        "- Start/End: Start((Start)) and End((End))\n"
-        "- Process: n1[Initialize] or n2[Call functionX] or n3[Set value]\n"
-        "- Decision: n4{{{{Check condition}}}} or n5{{{{Loop check}}}}\n\n"
-        "CONTROL FLOW PATTERNS:\n"
-        "1. If/else - BOTH nodes must have labels:\n"
-        "   n1{{{{Check condition}}}} --> |true| n2[Execute if block]\n"
-        "   n1 --> |false| n3[Execute else block]\n\n"
-        "2. Loop - ALL nodes must have labels:\n"
-        "   n1[Initialize counter] --> n2{{{{Check counter less than limit}}}}\n"
-        "   n2 --> |true| n3[Execute loop body]\n"
-        "   n3 --> n4[Increment counter]\n"
-        "   n4 --> n2\n"
-        "   n2 --> |false| n5[Exit loop]\n\n"
-        "3. Switch - ALL cases must have labels:\n"
-        "   n1{{{{Evaluate switch variable}}}} --> |case1| n2[Handle case 1]\n"
-        "   n1 --> |case2| n3[Handle case 2]\n"
-        "   n1 --> |default| n4[Handle default]\n\n"
-        f"4. Function calls detected: {function_calls_str}\n"
-        "   Show as: n1[Call functionName]\n\n"
-        "5. Return statements:\n"
-        "   n1[Return value] --> End((End))\n\n"
-        "LABEL CONTENT RULES:\n"
-        "- Describe the actual code operation (not the syntax)\n"
-        "- Use 3-8 words\n"
-        "- Plain English only\n"
-        "- NO operators: Replace < > == != with words\n"
-        "- NO parentheses in labels\n\n"
-        "COMPLETE EXAMPLE:\n"
+        "Create a Mermaid flowchart for this C++ function.\n\n"
+        "FLOWCHART PURPOSE: Show CONTROL FLOW, not every statement\n\n"
+        "INCLUDE in flowchart:\n"
+        "1. Branches: if/else, switch/case\n"
+        "2. Loops: for, while, do-while\n"
+        "3. Function calls (as single box, do NOT expand)\n"
+        "4. Return statements\n"
+        "5. Sequential blocks (summarized as ONE node)\n\n"
+        "EXCLUDE from flowchart:\n"
+        "- Individual variable assignments\n"
+        "- Arithmetic operations\n"
+        "- Iterator increments\n"
+        "- Temporary variables\n"
+        "- Logging statements\n\n"
+        "GROUPING RULE:\n"
+        "Group 3-5 sequential statements into ONE semantic node\n"
+        "Example: Instead of separate nodes for a=1, b=2, c=3\n"
+        "Use ONE node: [Initialize variables a, b, c]\n\n"
+        "FORMAT RULES:\n"
+        "1. Start with: flowchart TD\n"
+        "2. Start node: Start((Start))\n"
+        "3. End node: End((End))\n"
+        "4. Process: n1[Semantic description]\n"
+        "5. Decision: n2{{{{Condition in words}}}}\n"
+        "6. ALL nodes MUST have labels\n"
+        "7. NO operators in labels (use words)\n\n"
+        f"Detected function calls: {function_calls_str}\n"
+        f"Control flow summary:\n{control_summary}\n\n"
+        "EXAMPLE (Notice grouping of sequential operations):\n"
         "flowchart TD\n"
-        "Start((Start)) --> n1[Check if input is valid]\n"
-        "n1 --> n2{{{{Validate input not null}}}}\n"
-        "n2 --> |true| n3[Process the input data]\n"
-        "n2 --> |false| n4[Return error code]\n"
-        "n3 --> n5[Store result in variable]\n"
-        "n5 --> End((End))\n"
-        "n4 --> End((End))\n\n"
-        "FUNCTION CODE:\n"
-        "{function}\n\n"
-        "OUTPUT (Mermaid flowchart ONLY, ensure ALL nodes have labels):"
+        "Start((Start)) --> n1[Initialize data structures]\n"
+        "n1 --> n2{{{{Check if input valid}}}}\n"
+        "n2 --> |true| n3[Process data in loop]\n"
+        "n2 --> |false| n4[Return error]\n"
+        "n3 --> n5[Finalize and return result]\n"
+        "n4 --> End((End))\n"
+        "n5 --> End((End))\n\n"
+        "Function code:\n{function}\n\n"
+        "Generate flowchart (focus on control flow, group sequential statements):"
     )
 
-    print(f"\nGenerating flowchart for function: {function_name}")
+    print(f"\nGenerating flowchart for: {function_name} ({len(function_content)} lines)")
     query = flowchart_prompt.format(function="\n".join(function_content))
     
     retries = 0
@@ -422,84 +515,64 @@ def generate_flowchart(function_content, function_name):
     while retries < max_retries:
         try:
             messages = [HumanMessage(query)]
-            flowchart_response = llm.invoke(messages)
-            raw_content = flowchart_response.content
+            response = llm.invoke(messages)
+            raw_content = response.content
             
-            if not raw_content or len(raw_content.strip()) == 0:
+            if not raw_content or not raw_content.strip():
                 last_error = "LLM returned empty response"
                 print(f"Attempt {retries + 1}: {last_error}")
                 retries += 1
                 continue
 
-            extracted_content = extract_flowchart_from_response(raw_content)
+            extracted = extract_flowchart_from_response(raw_content)
             
-            if not extracted_content or len(extracted_content.strip()) == 0:
-                last_error = "Could not extract flowchart from LLM response"
+            if not extracted or not extracted.strip():
+                last_error = "Could not extract flowchart"
                 print(f"Attempt {retries + 1}: {last_error}")
                 retries += 1
                 continue
 
-            sanitized_content = sanitize_flowchart_content(extracted_content)
+            sanitized = sanitize_flowchart_content(extracted)
 
-            if not sanitized_content or len(sanitized_content.strip()) == 0:
-                last_error = "Flowchart became empty after sanitization"
+            if not sanitized or not sanitized.strip():
+                last_error = "Flowchart empty after sanitization"
                 print(f"Attempt {retries + 1}: {last_error}")
                 retries += 1
                 continue
 
-            is_valid, error_msg = validate_mermaid_syntax(sanitized_content)
+            is_valid, error_msg = validate_mermaid_syntax(sanitized)
             
             if not is_valid:
                 last_error = f"Validation failed: {error_msg}"
                 print(f"Attempt {retries + 1}: {last_error}")
                 retries += 1
-                # Add specific feedback to help LLM fix the issue
-                query = flowchart_prompt + f"\n\nPREVIOUS ATTEMPT FAILED: {error_msg}\nPlease fix this issue and ensure ALL nodes have proper labels."
+                query = flowchart_prompt + f"\n\nPREVIOUS FAILED: {error_msg}\nFix this."
                 continue
 
-            # Try to generate image
+            # Generate image
             currdir = os.getcwd()
             try:
                 os.chdir(mermaid_path)
 
                 out = subprocess.check_output(
-                    ["node", "index.js", sanitized_content, function_name + ".png"],
+                    ["node", "index.js", sanitized, f"{function_name}.png"],
                     stderr=subprocess.STDOUT,
                     timeout=30
                 )
-                output_str = str(out.lower())
                 
                 os.chdir(currdir)
 
-                if "error" not in output_str and "failed" not in output_str:
-                    img_path = os.path.join(mermaid_path, function_name + ".png")
+                if "error" not in str(out.lower()):
+                    img_path = os.path.join(mermaid_path, f"{function_name}.png")
                     if os.path.exists(img_path):
-                        print(f"✓ Flowchart generated successfully")
-                        return sanitized_content, img_path, "Success"
+                        print(f"✓ Success")
+                        return sanitized, img_path, "Success"
                     else:
-                        last_error = "Image file not created"
-                        print(f"Attempt {retries + 1}: {last_error}")
+                        last_error = "Image not created"
                 else:
-                    error_match = re.search(r'error[:\s]+([^\n]+)', output_str)
-                    if error_match:
-                        last_error = f"Mermaid error: {error_match.group(1)[:100]}"
-                    else:
-                        last_error = f"Mermaid conversion error: {output_str[:200]}"
-                    print(f"Attempt {retries + 1}: {last_error}")
+                    last_error = f"Mermaid error: {str(out)[:100]}"
+                print(f"Attempt {retries + 1}: {last_error}")
                     
-            except subprocess.TimeoutExpired:
-                os.chdir(currdir)
-                last_error = "Mermaid conversion timeout"
-                print(f"Attempt {retries + 1}: {last_error}")
-            except subprocess.CalledProcessError as e:
-                os.chdir(currdir)
-                last_error = f"Mermaid process error: {str(e)[:100]}"
-                print(f"Attempt {retries + 1}: {last_error}")
-            except FileNotFoundError:
-                os.chdir(currdir)
-                last_error = "Mermaid converter not found - check mermaid_path configuration"
-                print(f"Attempt {retries + 1}: {last_error}")
-                break
             except Exception as e:
                 os.chdir(currdir)
                 last_error = f"Image generation error: {str(e)[:100]}"
@@ -507,20 +580,19 @@ def generate_flowchart(function_content, function_name):
 
             retries += 1
             if retries < max_retries:
-                query = flowchart_prompt + f"\n\nPREVIOUS ATTEMPT FAILED: {last_error}\nPlease fix and regenerate."
+                query = flowchart_prompt + f"\n\nPREVIOUS FAILED: {last_error}\nFix it."
 
         except Exception as e:
-            print(f"Exception during flowchart generation attempt {retries + 1}: {e}")
+            print(f"Exception attempt {retries + 1}: {e}")
             last_error = f"Exception: {str(e)[:100]}"
             retries += 1
 
-    print(f"✗ Failed to generate valid flowchart after {max_retries} attempts")
-    print(f"  Last error: {last_error}")
-    return None, None, last_error or "Failed after all retries"
+    print(f"✗ Failed after {max_retries} attempts: {last_error}")
+    return None, None, last_error or "Failed"
 
 
 def extract_node_info(cursor, file_path, module_name):
-    """Extract information about a function node from AST"""
+    """Extract function information from AST"""
     extent = cursor.extent
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -528,17 +600,16 @@ def extract_node_info(cursor, file_path, module_name):
         
         start_line = max(0, extent.start.line - 1)
         end_line = min(len(lines), extent.end.line)
-        function_lines = lines[start_line:end_line]
-        function_lines = [line.rstrip() for line in function_lines if line.strip()]
+        function_lines = [line.rstrip() for line in lines[start_line:end_line] if line.strip()]
 
         if not function_lines:
-            print(f"Warning: No content extracted for function {cursor.spelling}")
             return None
 
-        print(f"\nProcessing function: {cursor.spelling} ({len(function_lines)} lines)")
+        print(f"\nProcessing: {cursor.spelling} ({len(function_lines)} lines)")
 
-        flowchart_content, flowchart_image_path, flowchart_feedback = generate_flowchart(
-            function_lines, cursor.spelling
+        # Pass cursor and file lines for control flow analysis
+        flowchart, img_path, feedback = generate_flowchart(
+            function_lines, cursor.spelling, cursor, lines, extent.start.line
         )
 
         description = generate_function_description(function_lines)
@@ -553,21 +624,19 @@ def extract_node_info(cursor, file_path, module_name):
             "file_name": file_path,
             "module_name": module_name,
             "description": description,
-            "flowchart": flowchart_content,
-            "feedback": flowchart_feedback,
-            "img": flowchart_image_path,
+            "flowchart": flowchart,
+            "feedback": feedback,
+            "img": img_path,
             "callees": [],
             "callers": [],
         }
     except Exception as e:
-        print(f"Error extracting node info for {cursor.spelling}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error extracting {cursor.spelling}: {e}")
         return None
 
 
 def visit(cursor, file_path, module_name, nodes, call_edges, current_fn, visited=None):
-    """Recursively visit AST nodes to extract functions and call relationships"""
+    """Visit AST nodes"""
     if visited is None:
         visited = set()
 
@@ -610,12 +679,12 @@ def visit(cursor, file_path, module_name, nodes, call_edges, current_fn, visited
 
 
 def parse_file(index, file_path, root_dir, compile_args, nodes, call_edges):
-    """Parse a single C++ file and extract function information"""
+    """Parse a single C++ file"""
     module_name = get_module_name(file_path, root_dir)
 
     try:
         print(f"\n{'='*60}")
-        print(f"Parsing file: {os.path.basename(file_path)}")
+        print(f"Parsing: {os.path.basename(file_path)}")
         print(f"{'='*60}")
 
         tu = index.parse(
@@ -630,7 +699,7 @@ def parse_file(index, file_path, root_dir, compile_args, nodes, call_edges):
         visit(tu.cursor, file_path, module_name, my_nodes, my_call_edges, None)
 
         if not my_nodes:
-            print(f"⚠ No functions found in {file_path}")
+            print(f"⚠ No functions found")
             return
 
         file_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -642,32 +711,29 @@ def parse_file(index, file_path, root_dir, compile_args, nodes, call_edges):
         else:
             file_index_map[file_name] = 1
 
-        meta_file_name += ".json"
-        file_name_docx = file_name + ".docx"
+        json_file = os.path.join(out_dir, f"{meta_file_name}.json")
+        docx_file = os.path.join(out_dir, f"{file_name}.docx")
 
-        print(f"\nGenerating outputs:")
-        print(f"  - Word Document: {file_name_docx}")
-        print(f"  - JSON Metadata: {meta_file_name}")
+        print(f"\nOutputs: {os.path.basename(docx_file)}, {os.path.basename(json_file)}")
 
-        generate_word_document(list(my_nodes.values()), os.path.join(out_dir, file_name_docx))
+        generate_word_document(list(my_nodes.values()), docx_file)
 
-        with open(os.path.join(out_dir, meta_file_name), "w", encoding='utf-8') as f:
+        with open(json_file, "w", encoding='utf-8') as f:
             json.dump(list(my_nodes.values()), f, indent=2, ensure_ascii=False)
 
-        print(f"✓ File processing complete: {len(my_nodes)} functions")
+        print(f"✓ Complete: {len(my_nodes)} functions")
 
         nodes.update(my_nodes)
         call_edges.update(my_call_edges)
 
     except Exception as e:
-        print(f"\n✗ ERROR parsing {file_path}:")
-        print(f"  {str(e)}")
+        print(f"\n✗ ERROR: {e}")
         import traceback
         traceback.print_exc()
 
 
 def parse_codebase(root_dir, compile_args=None):
-    """Parse entire C++ codebase and extract all functions"""
+    """Parse C++ codebase"""
     compile_args = compile_args or ["-std=c++17"]
     index = cindex.Index.create()
 
@@ -678,106 +744,88 @@ def parse_codebase(root_dir, compile_args=None):
     for root, _, files in os.walk(root_dir):
         for f in files:
             if is_cpp_file(f):
-                path = os.path.join(root, f)
-                cpp_files.append(path)
+                cpp_files.append(os.path.join(root, f))
 
     print(f"\n{'='*60}")
-    print(f"CODEBASE ANALYSIS STARTED")
+    print(f"ANALYSIS STARTED")
     print(f"{'='*60}")
-    print(f"Root directory: {root_dir}")
-    print(f"Found {len(cpp_files)} C++ files to process")
-    print(f"Output directory: {out_dir}")
+    print(f"Root: {root_dir}")
+    print(f"Files: {len(cpp_files)}")
+    print(f"Output: {out_dir}")
     print(f"{'='*60}\n")
 
     for idx, path in enumerate(cpp_files, 1):
-        print(f"\n[{idx}/{len(cpp_files)}] Processing: {os.path.relpath(path, root_dir)}")
+        print(f"\n[{idx}/{len(cpp_files)}] {os.path.relpath(path, root_dir)}")
         try:
             parse_file(index, path, root_dir, compile_args, nodes, call_edges)
         except Exception as e:
-            print(f"✗ Failed to parse {path}: {e}")
+            print(f"✗ Failed: {e}")
 
     return list(nodes.values())
 
 
 def generate_word_document(data, doc_name):
-    """Generate Word document with function flowcharts"""
+    """Generate Word document"""
     if not data:
-        print("⚠ No data to generate document")
         return
 
     doc = Document()
 
     for index, item in enumerate(data, start=1):
-        heading = f"1.1.{index} {item['name']}"
-        doc.add_heading(heading, level=1)
+        doc.add_heading(f"1.1.{index} {item['name']}", level=1)
 
         table = doc.add_table(rows=3, cols=2, style="Table Grid")
         
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = "Requirement ID"
-        hdr_cells[1].text = f"SAVV8-SwU-{index}"
+        table.rows[0].cells[0].text = "Requirement ID"
+        table.rows[0].cells[1].text = f"SAVV8-SwU-{index}"
 
         if item.get("description"):
-            desc_cells = table.rows[1].cells
-            desc_cells[0].text = "Description"
-            desc_cells[1].text = item["description"]
+            table.rows[1].cells[0].text = "Description"
+            table.rows[1].cells[1].text = item["description"]
 
-        flow_cells = table.rows[2].cells
-        flow_cells[0].text = "Flowchart"
+        table.rows[2].cells[0].text = "Flowchart"
 
-        if item.get("img") and item["img"] and os.path.exists(item["img"]):
+        if item.get("img") and os.path.exists(item["img"]):
             try:
-                flow_cells[1].add_paragraph().add_run().add_picture(
+                table.rows[2].cells[1].add_paragraph().add_run().add_picture(
                     item["img"], width=Inches(6.0)
                 )
             except Exception as e:
-                print(f"  ⚠ Error adding image for {item['name']}: {e}")
-                flow_cells[1].text = f"Flowchart image error: {str(e)[:100]}"
+                print(f"  ⚠ Image error: {e}")
+                table.rows[2].cells[1].text = f"Image error: {str(e)[:100]}"
         else:
-            error_msg = item.get('feedback', 'Flowchart generation failed')
-            flow_cells[1].text = f"Flowchart not available: {error_msg}"
+            table.rows[2].cells[1].text = f"Not available: {item.get('feedback', 'Unknown')}"
 
     try:
         doc.save(doc_name)
-        print(f"  ✓ Document saved: {doc_name}")
+        print(f"  ✓ Document saved")
     except Exception as e:
-        print(f"  ✗ Error saving document {doc_name}: {e}")
+        print(f"  ✗ Save error: {e}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Generate flowcharts for C++ functions using LLM",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python code.py /path/to/cpp/project
-  python code.py /path/to/cpp/project --std c++20
-  python code.py D:\\git-project\\poseidonos\\src\\memory_checker
-        """
-    )
-    parser.add_argument("path", help="C++ codebase root directory or specific file")
+    parser = argparse.ArgumentParser(description="C++ Function Flowchart Generator")
+    parser.add_argument("path", help="C++ codebase directory or file")
     parser.add_argument("--std", default="c++17", help="C++ standard (default: c++17)")
-    parser.add_argument("--libclang", help="Path to libclang library (optional)")
+    parser.add_argument("--libclang", help="Path to libclang library")
     args = parser.parse_args()
 
     if args.libclang:
         cindex.Config.set_library_file(args.libclang)
 
     if not os.path.exists(args.path):
-        print(f"✗ Error: Path does not exist: {args.path}")
+        print(f"✗ Error: Path not found: {args.path}")
         exit(1)
 
     os.makedirs(out_dir, exist_ok=True)
     
-    compile_args = [f"-std={args.std}"]
-    
-    ast = parse_codebase(args.path, compile_args=compile_args)
+    ast = parse_codebase(args.path, [f"-std={args.std}"])
 
     print(f"\n{'='*60}")
-    print(f"PROCESSING COMPLETE")
+    print(f"COMPLETE")
     print(f"{'='*60}")
-    print(f"Total functions processed: {len(ast)}")
-    print(f"Output directory: {out_dir}")
+    print(f"Functions: {len(ast)}")
+    print(f"Output: {out_dir}")
     print(f"{'='*60}\n")
