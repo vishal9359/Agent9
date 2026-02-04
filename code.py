@@ -265,6 +265,52 @@ def replace_brackets_in_brackets(text):
     return "".join(result)
 
 
+def clean_label_text(label):
+    """Clean label text to avoid Mermaid parse errors and HTML entities."""
+    if not label:
+        return ""
+
+    label = clean_unicode_chars(label)
+
+    # Replace common HTML entities if they appear
+    entity_map = {
+        "&#40;": " ",
+        "&#41;": " ",
+        "&#91;": " ",
+        "&#93;": " ",
+        "&#123;": " ",
+        "&#125;": " ",
+        "&amp;": " and ",
+    }
+    for entity, replacement in entity_map.items():
+        label = label.replace(entity, replacement)
+
+    # Replace operators with words
+    label = (
+        label.replace("!=", " not equal ")
+        .replace("==", " equal ")
+        .replace(">=", " greater or equal ")
+        .replace("<=", " less or equal ")
+        .replace(">", " greater ")
+        .replace("<", " less ")
+        .replace("&&", " and ")
+        .replace("||", " or ")
+    )
+
+    # Replace function call syntax like foo(bar) -> call foo
+    label = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)", r"call \1", label)
+
+    # Remove punctuation that causes Mermaid parse errors
+    label = re.sub(r"[;:]", " ", label)
+    label = re.sub(r"[{}()\[\]]", " ", label)
+    label = label.replace("?", " ")
+
+    # Collapse whitespace
+    label = re.sub(r"\s+", " ", label).strip()
+
+    return label
+
+
 def sanitize_flowchart_content(flowchart_content):
     """Sanitize flowchart content to be Mermaid-compatible"""
     if not flowchart_content:
@@ -274,7 +320,7 @@ def sanitize_flowchart_content(flowchart_content):
     if not flowchart_content:
         return ""
     
-    # Fix single braces to double braces FIRST
+    # Fix single braces to double braces for decision nodes
     flowchart_content = re.sub(r'(n\d+)\{([^}]*)\}(?!\})', r'\1{{\2}}', flowchart_content)
     
     flowchart_list = flowchart_content.split("\n")
@@ -309,44 +355,17 @@ def sanitize_flowchart_content(flowchart_content):
         # Instead, just remove them from node labels (except Start/End)
         # Keep them in edge labels
         
-        # Replace operators in decision nodes {{...}}
-        if "{{" in processed_line and "}}" in processed_line:
-            start_idx = processed_line.find("{{")
-            end_idx = processed_line.find("}}", start_idx)
-            if start_idx != -1 and end_idx != -1:
-                condition = processed_line[start_idx+2:end_idx]
-                # Replace operators
-                condition = (
-                    condition.replace("!=", " not equal ")
-                    .replace("==", " equal ")
-                    .replace(">=", " gte ")
-                    .replace("<=", " lte ")
-                    .replace(">", " gt ")
-                    .replace("<", " lt ")
-                    .replace("&&", " and ")
-                    .replace("||", " or ")
-                )
-                processed_line = processed_line[:start_idx+2] + condition + processed_line[end_idx:]
-        
-        # Replace operators in process nodes [...]
-        if "[" in processed_line and "]" in processed_line:
-            # Find all [...] blocks
-            parts = re.findall(r'\[([^\]]+)\]', processed_line)
-            for part in parts:
-                cleaned_part = (
-                    part.replace("!=", " not equal ")
-                    .replace("==", " equal ")
-                    .replace(">=", " gte ")
-                    .replace("<=", " lte ")
-                    .replace(">", " gt ")
-                    .replace("<", " lt ")
-                    .replace("&&", " and ")
-                    .replace("||", " or ")
-                )
-                processed_line = processed_line.replace(f"[{part}]", f"[{cleaned_part}]")
-        
-        # Handle nested brackets
-        processed_line = replace_brackets_in_brackets(processed_line)
+        # Clean decision labels {{...}}
+        decision_parts = re.findall(r"\{\{([^}]*)\}\}", processed_line)
+        for part in decision_parts:
+            cleaned_part = clean_label_text(part)
+            processed_line = processed_line.replace(f"{{{{{part}}}}}", f"{{{{{cleaned_part}}}}}")
+
+        # Clean process labels [...]
+        process_parts = re.findall(r"\[([^\]]+)\]", processed_line)
+        for part in process_parts:
+            cleaned_part = clean_label_text(part)
+            processed_line = processed_line.replace(f"[{part}]", f"[{cleaned_part}]")
         
         new_list.append(processed_line)
 
@@ -370,9 +389,16 @@ def validate_mermaid_syntax(mermaid_content):
     if "-->" not in mermaid_content and "--" not in mermaid_content:
         return False, "No connections found"
 
+    if "&#" in mermaid_content:
+        return False, "HTML entities detected in labels. Use plain text only."
+
     lines = [l.strip() for l in mermaid_content.split("\n") if l.strip()]
     if len(lines) < 3:
         return False, f"Too few lines: {len(lines)}"
+
+    for line in lines:
+        if line.count("-->") > 1:
+            return False, "Multiple arrows in one line. Use one edge per line."
     
     # Check for unlabeled nodes
     defined_nodes = set()
