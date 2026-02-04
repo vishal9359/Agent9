@@ -274,6 +274,9 @@ def sanitize_flowchart_content(flowchart_content):
     if not flowchart_content:
         return ""
     
+    # Fix single braces to double braces FIRST
+    flowchart_content = re.sub(r'(n\d+)\{([^}]*)\}(?!\})', r'\1{{\2}}', flowchart_content)
+    
     flowchart_list = flowchart_content.split("\n")
     new_list = []
     flowchart_started = False
@@ -302,48 +305,17 @@ def sanitize_flowchart_content(flowchart_content):
             
         processed_line = original_line
         
-        # Preserve Start((Start)) and End((End))
-        has_start = "((Start))" in processed_line
-        has_end = "((End))" in processed_line
+        # Don't replace parentheses with HTML entities
+        # Instead, just remove them from node labels (except Start/End)
+        # Keep them in edge labels
         
-        if not has_start and not has_end:
-            temp_line = ""
-            in_arrow = False
-            i = 0
-            while i < len(processed_line):
-                if i < len(processed_line) - 1:
-                    two_char = processed_line[i:i+2]
-                    if two_char in ["--", "->", "=>", "-.","=="]:
-                        in_arrow = True
-                        temp_line += two_char
-                        i += 2
-                        continue
-                
-                if processed_line[i] == " " and in_arrow:
-                    in_arrow = False
-                
-                if not in_arrow:
-                    if processed_line[i] == "(":
-                        temp_line += "&#40;"
-                    elif processed_line[i] == ")":
-                        temp_line += "&#41;"
-                    else:
-                        temp_line += processed_line[i]
-                else:
-                    temp_line += processed_line[i]
-                i += 1
-            processed_line = temp_line
-        
-        processed_line = processed_line.replace("&#40;&#40;Start&#41;&#41;", "((Start))")
-        processed_line = processed_line.replace("&#40;&#40;End&#41;&#41;", "((End))")
-        processed_line = replace_brackets_in_brackets(processed_line)
-        
-        # Replace operators
+        # Replace operators in decision nodes {{...}}
         if "{{" in processed_line and "}}" in processed_line:
             start_idx = processed_line.find("{{")
             end_idx = processed_line.find("}}", start_idx)
             if start_idx != -1 and end_idx != -1:
                 condition = processed_line[start_idx+2:end_idx]
+                # Replace operators
                 condition = (
                     condition.replace("!=", " not equal ")
                     .replace("==", " equal ")
@@ -355,6 +327,26 @@ def sanitize_flowchart_content(flowchart_content):
                     .replace("||", " or ")
                 )
                 processed_line = processed_line[:start_idx+2] + condition + processed_line[end_idx:]
+        
+        # Replace operators in process nodes [...]
+        if "[" in processed_line and "]" in processed_line:
+            # Find all [...] blocks
+            parts = re.findall(r'\[([^\]]+)\]', processed_line)
+            for part in parts:
+                cleaned_part = (
+                    part.replace("!=", " not equal ")
+                    .replace("==", " equal ")
+                    .replace(">=", " gte ")
+                    .replace("<=", " lte ")
+                    .replace(">", " gt ")
+                    .replace("<", " lt ")
+                    .replace("&&", " and ")
+                    .replace("||", " or ")
+                )
+                processed_line = processed_line.replace(f"[{part}]", f"[{cleaned_part}]")
+        
+        # Handle nested brackets
+        processed_line = replace_brackets_in_brackets(processed_line)
         
         new_list.append(processed_line)
 
@@ -489,7 +481,9 @@ def generate_flowchart(function_content, function_name, function_cursor=None, fi
         "4. Process: n1[Semantic description]\n"
         "5. Decision: n2{{{{Condition in words}}}}\n"
         "6. ALL nodes MUST have labels\n"
-        "7. NO operators in labels (use words)\n\n"
+        "7. NO operators in labels (use words)\n"
+        "8. NO parentheses in labels: use 'Call function' not 'function()'\n"
+        "9. Each arrow connection on separate line for clarity\n\n"
         f"Detected function calls: {function_calls_str}\n"
         f"Control flow summary:\n{control_summary}\n\n"
         "EXAMPLE (Notice grouping of sequential operations):\n"
