@@ -50,6 +50,19 @@ MAX_LABEL_CHARS = 80        # max label length in Mermaid
 MAX_SUMMARY_RETRIES = 3     # per block summary
 
 
+def _ck(name: str):
+    """
+    Return cindex.CursorKind.<name> if available in this libclang binding, else None.
+    This avoids crashes across different clang/python bindings.
+    """
+    return getattr(cindex.CursorKind, name, None)
+
+
+# CursorKind compatibility (varies by libclang version / python bindings)
+CK_CXX_TRY = _ck("CXX_TRY_STMT") or _ck("TRY_STMT")
+CK_CXX_CATCH = _ck("CXX_CATCH_STMT")
+
+
 def is_cpp_file(path: str) -> bool:
     return path.endswith(SUPPORTED_EXT)
 
@@ -288,7 +301,7 @@ class FlowBuilder:
         if k == cindex.CursorKind.SWITCH_STMT:
             return self._build_switch(cursor)
 
-        if k == cindex.CursorKind.TRY_STMT:
+        if CK_CXX_TRY is not None and k == CK_CXX_TRY:
             return self._build_try(cursor)
 
         return self.build_compound(cursor)
@@ -333,11 +346,13 @@ class FlowBuilder:
             cindex.CursorKind.WHILE_STMT,
             cindex.CursorKind.DO_STMT,
             cindex.CursorKind.SWITCH_STMT,
-            cindex.CursorKind.TRY_STMT,
+            CK_CXX_TRY,
             cindex.CursorKind.RETURN_STMT,
             cindex.CursorKind.BREAK_STMT,
             cindex.CursorKind.CONTINUE_STMT,
         }
+        # Remove Nones (when a kind doesn't exist in this binding)
+        CONTROL_KINDS = {k for k in CONTROL_KINDS if k is not None}
 
         for child in children:
             if child.kind in CONTROL_KINDS:
@@ -474,6 +489,10 @@ class FlowBuilder:
         children = list(cursor.get_children())
         try_block = children[0] if children else None
         catches = children[1:] if len(children) > 1 else []
+
+        # Some bindings expose catch blocks as CXX_CATCH_STMT nodes; filter if possible.
+        if CK_CXX_CATCH is not None:
+            catches = [c for c in catches if c.kind == CK_CXX_CATCH] or catches
 
         decision = self.new_node("decision", "Exception occurs")
         after = self.new_node("process", "After try catch")
