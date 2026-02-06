@@ -30,6 +30,7 @@ from docx import Document
 from docx.shared import Inches
 from langchain.messages import HumanMessage
 from langchain_ollama import ChatOllama
+from enum import Enum
 
 
 # OPTIONAL: Set explicitly if needed
@@ -49,6 +50,13 @@ MAX_BLOCK_LINES = 80        # max lines per LLM block summary
 MAX_LABEL_CHARS = 80        # max label length in Mermaid
 MAX_SUMMARY_RETRIES = 3     # per block summary
 
+# Flowchart granularity / aggregation
+PENDING_SEGMENT_MAX_LINES = 20   # split long straight-line code into segments before LLM summary
+PENDING_SEGMENT_MAX_STMTS = 6    # upper bound on statements per segment
+MAX_REGION_NODES = 4             # max basic-block nodes merged into one semantic region
+REGION_NAME_WORDS_MIN = 3
+REGION_NAME_WORDS_MAX = 6
+
 
 def _ck(name: str):
     """
@@ -61,6 +69,38 @@ def _ck(name: str):
 # CursorKind compatibility (varies by libclang version / python bindings)
 CK_CXX_TRY = _ck("CXX_TRY_STMT") or _ck("TRY_STMT")
 CK_CXX_CATCH = _ck("CXX_CATCH_STMT")
+
+
+class SemanticRole(Enum):
+    INIT = "init"
+    VALIDATION = "validation"
+    LOOP = "loop"
+    COMPUTE = "compute"
+    IO = "io"
+    ERROR = "error"
+    FINALIZE = "finalize"
+
+
+def infer_role(label: str) -> SemanticRole:
+    """
+    Infer a semantic role from an already-sanitized label.
+    Heuristic only, not codebase-specific (no hardcoding to examples).
+    """
+    l = (label or "").lower()
+
+    if any(w in l for w in ("init", "initialize", "create", "setup", "prepare", "allocate")):
+        return SemanticRole.INIT
+    if any(w in l for w in ("check", "validate", "verify", "ensure", "guard")):
+        return SemanticRole.VALIDATION
+    if any(w in l for w in ("loop", "iterate", "repeat", "traverse", "scan")):
+        return SemanticRole.LOOP
+    if any(w in l for w in ("print", "output", "log", "write", "read", "emit")):
+        return SemanticRole.IO
+    if any(w in l for w in ("error", "fail", "exception", "catch", "throw")):
+        return SemanticRole.ERROR
+    if any(w in l for w in ("cleanup", "finalize", "return", "finish", "close")):
+        return SemanticRole.FINALIZE
+    return SemanticRole.COMPUTE
 
 
 def is_cpp_file(path: str) -> bool:
@@ -197,9 +237,11 @@ def _summarize_once(block_text: str) -> str:
 
     prompt = (
         "You summarize a C++ code block for a flowchart node.\n"
+        "Goal: describe the intent/logic, not the code phrasing.\n"
         "Strict rules:\n"
         "- Output ONE short phrase (3 to 8 words).\n"
         "- Do NOT invent behavior outside this block.\n"
+        "- Avoid trivial variable names and numeric literals unless essential.\n"
         "- If the block calls functions, mention their names exactly.\n"
         "- No operators (==, !=, >, <) and no parentheses.\n"
         "- ASCII only.\n"
@@ -240,11 +282,18 @@ class FlowBuilder:
         self._next_id = 1
         self.loop_stack: list[tuple[str, str]] = []  # (continue_target, break_target)
         self.switch_stack: list[str] = []  # break_target
+        self.node_meta: dict[str, dict] = {}  # node_id -> metadata (role, original_text, etc.)
 
     def new_node(self, shape: str, label: str) -> str:
         nid = f"n{self._next_id}"
         self._next_id += 1
-        self.nodes[nid] = (shape, clean_label_text(label))
+        clean = clean_label_text(label)
+        self.nodes[nid] = (shape, clean)
+        self.node_meta[nid] = {
+            "role": infer_role(clean),
+            "label": clean,
+            "shape": shape,
+        }
         return nid
 
     def add_edge(self, src: str, dst: str, label: str = ""):
@@ -329,15 +378,44 @@ class FlowBuilder:
             nonlocal entry, curr_exits, pending
             if not pending:
                 return
-            text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in pending) if t)
-            label = summarize_block_with_llm(text)
-            n = self.new_node("process", label)
-            if entry is None:
-                entry = n
-            if curr_exits:
-                for ex in curr_exits:
-                    self.add_edge(ex, n)
-            curr_exits = [n]
+
+            # Split long straight-line code into smaller segments deterministically.
+            segments: list[list] = []
+            current: list = []
+            current_lines = 0
+
+            for stmt in pending:
+                txt = cursor_text(stmt, self.file_lines)
+                line_count = max(1, len(txt.splitlines())) if txt else 1
+
+                if (
+                    current
+                    and (
+                        len(current) >= PENDING_SEGMENT_MAX_STMTS
+                        or (current_lines + line_count) > PENDING_SEGMENT_MAX_LINES
+                    )
+                ):
+                    segments.append(current)
+                    current = []
+                    current_lines = 0
+
+                current.append(stmt)
+                current_lines += line_count
+
+            if current:
+                segments.append(current)
+
+            for seg in segments:
+                text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in seg) if t)
+                label = summarize_block_with_llm(text)
+                n = self.new_node("process", label)
+                if entry is None:
+                    entry = n
+                if curr_exits:
+                    for ex in curr_exits:
+                        self.add_edge(ex, n)
+                curr_exits = [n]
+
             pending = []
 
         CONTROL_KINDS = {
@@ -373,6 +451,172 @@ class FlowBuilder:
             n = self.new_node("process", "No operation")
             return n, [n]
         return entry, curr_exits
+
+
+@dataclass
+class Region:
+    id: str
+    nodes: list[str]           # node ids in detailed graph
+    shape: str                 # "process" or "decision"
+    role: SemanticRole
+    label: str = ""
+
+
+def build_regions(graph: Graph, node_meta: dict[str, dict]) -> list[Region]:
+    """
+    Merge linear chains of PROCESS nodes with same role.
+    Deterministic: only merges when indegree==1 and outdegree==1 between nodes.
+    """
+    indeg = defaultdict(int)
+    out = defaultdict(list)
+    for src, dst, _ in graph.edges:
+        if src in ("Start", "End") or dst in ("Start", "End"):
+            continue
+        indeg[dst] += 1
+        out[src].append(dst)
+
+    visited = set()
+    regions: list[Region] = []
+    rid = 1
+
+    for nid, (shape, label) in graph.nodes.items():
+        if nid in visited:
+            continue
+
+        meta = node_meta.get(nid, {})
+        role = meta.get("role", infer_role(label))
+
+        # decisions are never merged (single node region)
+        if shape == "decision":
+            regions.append(Region(id=f"R{rid}", nodes=[nid], shape=shape, role=SemanticRole.VALIDATION, label=label))
+            visited.add(nid)
+            rid += 1
+            continue
+
+        # process node: attempt to merge forward in a linear chain
+        chain = [nid]
+        visited.add(nid)
+        curr = nid
+
+        while len(chain) < MAX_REGION_NODES:
+            nxts = out.get(curr, [])
+            if len(nxts) != 1:
+                break
+            nxt = nxts[0]
+            if nxt in visited:
+                break
+            nxt_shape, nxt_label = graph.nodes.get(nxt, ("", ""))
+            if nxt_shape != "process":
+                break
+            nxt_role = node_meta.get(nxt, {}).get("role", infer_role(nxt_label))
+            if nxt_role != role:
+                break
+            if indeg.get(nxt, 0) != 1:
+                break
+            chain.append(nxt)
+            visited.add(nxt)
+            curr = nxt
+
+        regions.append(Region(id=f"R{rid}", nodes=chain, shape="process", role=role))
+        rid += 1
+
+    return regions
+
+
+def name_region_with_llm(region: Region, graph: Graph) -> str:
+    """
+    Name a merged region using ONLY existing block labels (LLM never sees raw code here).
+    This keeps hallucination risk low even for huge functions.
+    """
+    labels = []
+    for n in region.nodes:
+        _, lbl = graph.nodes.get(n, ("process", ""))
+        if lbl:
+            labels.append(lbl)
+    if not labels:
+        return "Process block"
+    if len(labels) == 1:
+        return labels[0]
+
+    prompt = (
+        "You name a flowchart block from existing labels.\n"
+        "Rules:\n"
+        f"- {REGION_NAME_WORDS_MIN} to {REGION_NAME_WORDS_MAX} words.\n"
+        "- Do NOT invent new behavior.\n"
+        "- Use ONLY the provided labels.\n"
+        "- No punctuation.\n\n"
+        "Labels:\n"
+        + "\n".join(f"- {l}" for l in labels)
+        + "\n\nName:"
+    )
+    try:
+        resp = llm.invoke([HumanMessage(prompt)])
+        return clean_label_text(resp.content) or labels[0]
+    except Exception:
+        return labels[0]
+
+
+def render_abstract_mermaid(graph: Graph, regions: list[Region]) -> str:
+    """
+    Render region-level flowchart (gist view).
+    Keeps decision regions as diamonds and process regions as rectangles.
+    """
+    lines = ["flowchart TD", "Start((Start))"]
+
+    node_to_region = {}
+    for r in regions:
+        for n in r.nodes:
+            node_to_region[n] = r.id
+
+    # region nodes
+    for r in regions:
+        lbl = clean_label_text(r.label or r.id)
+        if r.shape == "decision":
+            lines.append(f"{r.id}{{{{{lbl}}}}}")
+        else:
+            lines.append(f"{r.id}[{lbl}]")
+    lines.append("End((End))")
+
+    # region edges
+    added = set()
+    start_targets = set()
+    end_sources = set()
+
+    for src, dst, elbl in graph.edges:
+        if src == "Start":
+            rs = node_to_region.get(dst)
+            if rs:
+                start_targets.add(rs)
+            continue
+        if dst == "End":
+            rs = node_to_region.get(src)
+            if rs:
+                end_sources.add(rs)
+            continue
+        if src in ("End",) or dst in ("Start",):
+            continue
+        rs = node_to_region.get(src)
+        rd = node_to_region.get(dst)
+        if not rs or not rd or rs == rd:
+            continue
+        key = (rs, rd, elbl.strip() if elbl else "")
+        # normalize: if multiple different labels for same rs->rd, drop label
+        key_nolbl = (rs, rd)
+        if key_nolbl in added:
+            continue
+        if elbl:
+            lines.append(f\"{rs} --> |{clean_label_text(elbl)}| {rd}\")
+        else:
+            lines.append(f\"{rs} --> {rd}\")
+        added.add(key_nolbl)
+
+    # Connect Start and End
+    for t in sorted(start_targets):
+        lines.append(f"Start --> {t}")
+    for s in sorted(end_sources):
+        lines.append(f"{s} --> End")
+
+    return "\n".join(lines) + "\n"
 
     def _build_if(self, cursor) -> tuple[str, list[str]]:
         children = list(cursor.get_children())
@@ -555,22 +799,34 @@ def validate_mermaid(mermaid: str) -> tuple[bool, Optional[str]]:
 
 
 def generate_flowchart_for_function(fn_cursor, file_lines: list[str]) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Returns abstract (gist) mermaid as primary, plus detailed mermaid via extra key in JSON.
+    """
     builder = FlowBuilder(file_lines)
     graph = builder.build_function(fn_cursor)
-    mermaid = render_mermaid(graph)
-
-    ok, err = validate_mermaid(mermaid)
+    detailed = render_mermaid(graph)
+    ok, err = validate_mermaid(detailed)
     if not ok:
-        return mermaid, None, f"Validation failed: {err}"
+        return detailed, None, f"Detailed validation failed: {err}"
 
-    # Image conversion
+    # Build/Name regions => abstract
+    regions = build_regions(graph, builder.node_meta)
+    for r in regions:
+        r.label = name_region_with_llm(r, graph)
+    abstract = render_abstract_mermaid(graph, regions)
+    ok2, err2 = validate_mermaid(abstract)
+    if not ok2:
+        # fall back to detailed if abstract failed (still deterministic)
+        abstract = detailed
+
+    # Image conversion: generate abstract image (and optionally detailed as _detailed)
     img_path = None
     feedback = None
     currdir = os.getcwd()
     try:
         os.chdir(mermaid_path)
         subprocess.check_output(
-            ["node", "index.js", mermaid, f"{fn_cursor.spelling}.png"],
+            ["node", "index.js", abstract, f"{fn_cursor.spelling}.png"],
             stderr=subprocess.STDOUT,
             timeout=30,
         )
@@ -580,7 +836,9 @@ def generate_flowchart_for_function(fn_cursor, file_lines: list[str]) -> tuple[s
     finally:
         os.chdir(currdir)
 
-    return mermaid, img_path, feedback
+    # Store detailed in a temp attribute on cursor for extract_node_info to pick up
+    setattr(fn_cursor, "_agent9_flowchart_detailed", detailed)
+    return abstract, img_path, feedback
 
 
 def generate_function_description(function_lines: list[str]) -> str:
@@ -612,6 +870,7 @@ def extract_node_info(fn_cursor, file_path: str, module_name: str) -> Optional[d
             return None
 
         mermaid, img_path, feedback = generate_flowchart_for_function(fn_cursor, file_lines)
+        mermaid_detailed = getattr(fn_cursor, "_agent9_flowchart_detailed", None)
 
         return {
             "uid": node_uid(fn_cursor),
@@ -624,6 +883,7 @@ def extract_node_info(fn_cursor, file_path: str, module_name: str) -> Optional[d
             "module_name": module_name,
             "description": generate_function_description(function_lines),
             "flowchart": mermaid,
+            "flowchart_detailed": mermaid_detailed,
             "feedback": feedback,
             "img": img_path,
             "callees": [],
