@@ -60,6 +60,21 @@ MAX_REGION_NODES = 5        # max CFG nodes to merge into one semantic region
 MAX_REGION_LINES = 25       # max source lines in a merged region (prevent over-collapsing)
 MIN_REGION_LINES = 3        # min lines to consider merging
 
+KEYWORD_TOKENS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "new",
+    "delete",
+    "sizeof",
+    "static_cast",
+    "dynamic_cast",
+    "const_cast",
+    "reinterpret_cast",
+}
+
 
 class SemanticRole(Enum):
     """Semantic role classification for code blocks."""
@@ -79,6 +94,7 @@ class Region:
     id: str
     nodes: list[str]
     role: SemanticRole
+    shape: str
     entry: str
     exits: list[str]
     label: str = ""
@@ -130,7 +146,35 @@ def clamp_label(s: str) -> str:
     return s
 
 
-def clean_label_text(label: str) -> str:
+def _replace_function_calls(text: str, for_condition: bool) -> str:
+    """
+    Replace function calls in a Mermaid-safe way.
+    - For conditions: keep function name without "call" (avoid "call if")
+    - For non-conditions: use "call <name>" to show black-box calls
+    """
+    if not text:
+        return text
+
+    def repl(match: re.Match) -> str:
+        name = match.group(1)
+        if name in KEYWORD_TOKENS:
+            return name
+        return name if for_condition else f"call {name}"
+
+    # Method calls: obj.method(...) or ptr->method(...)
+    def repl_method(match: re.Match) -> str:
+        obj = match.group(1)
+        method = match.group(2)
+        if method in KEYWORD_TOKENS:
+            return f"{obj} {method}"
+        return f"{obj} {method}" if for_condition else f"call {method}"
+
+    text = re.sub(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\.|->)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)", repl_method, text)
+    text = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)", repl, text)
+    return text
+
+
+def clean_label_text(label: str, for_condition: bool = False) -> str:
     """
     Mermaid-safe, readable label:
     - ASCII
@@ -151,8 +195,8 @@ def clean_label_text(label: str) -> str:
         .replace("<", " less ")
     )
 
-    # Replace function-call syntax foo(...) -> call foo
-    label = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)", r"call \1", label)
+    # Replace function-call syntax
+    label = _replace_function_calls(label, for_condition=for_condition)
 
     # Remove punctuation/brackets that can break Mermaid parsing
     label = re.sub(r"[{}()\[\];:]", " ", label)
@@ -160,6 +204,16 @@ def clean_label_text(label: str) -> str:
 
     label = re.sub(r"\s+", " ", label).strip()
     return clamp_label(label) or "Process block"
+
+
+def clean_condition_text(label: str) -> str:
+    """
+    Clean condition expressions for decision nodes.
+    Removes leading control keywords and avoids "call <keyword>" artifacts.
+    """
+    label = clean_unicode_chars(label or "")
+    label = re.sub(r"^\s*(if|for|while|switch)\b", "", label, flags=re.IGNORECASE).strip()
+    return clean_label_text(label, for_condition=True)
 
 
 def infer_role(label: str, code_text: str = "") -> SemanticRole:
@@ -480,7 +534,7 @@ class FlowBuilder:
         else_stmt = children[2] if len(children) > 2 else None
 
         cond_text = cursor_text(cond, self.file_lines) or "condition"
-        cond_label = clean_label_text(cond_text)
+        cond_label = clean_condition_text(cond_text)
         d = self.new_node("decision", f"Check {cond_label}", cond_text, 1)
 
         t_entry, t_exits = self.build_compound(then_stmt)
@@ -511,7 +565,7 @@ class FlowBuilder:
             body = children[-1] if children else None
 
         cond_text = cursor_text(cond, self.file_lines) or "loop condition"
-        cond_label = clean_label_text(cond_text)
+        cond_label = clean_condition_text(cond_text)
         check = self.new_node("decision", f"Check {cond_label}", cond_text, 1)
         after = self.new_node("process", "After loop", "", 1)
 
@@ -539,7 +593,7 @@ class FlowBuilder:
         body = children[1] if len(children) > 1 else None
 
         expr_text = cursor_text(expr, self.file_lines) or "expression"
-        expr_label = clean_label_text(expr_text)
+        expr_label = clean_condition_text(expr_text)
         d = self.new_node("decision", f"Switch on {expr_label}", expr_text, 1)
         after = self.new_node("process", "After switch", "", 1)
 
@@ -657,6 +711,7 @@ def build_regions(graph: Graph) -> list[Region]:
                 id=f"R{rid}",
                 nodes=[nid],
                 role=SemanticRole.VALIDATION,
+                shape="decision",
                 entry=nid,
                 exits=[nid],
                 line_count=node.get("line_count", 1)
@@ -706,6 +761,7 @@ def build_regions(graph: Graph) -> list[Region]:
             id=f"R{rid}",
             nodes=chain,
             role=role,
+            shape="process",
             entry=chain[0],
             exits=[chain[-1]],
             line_count=total_lines
@@ -776,8 +832,7 @@ def render_abstract_mermaid(graph: Graph, regions: list[Region]) -> str:
     for r in regions:
         label = clean_label_text(r.label or r.id)
 
-        # Decision-like regions
-        if r.role in (SemanticRole.VALIDATION, SemanticRole.LOOP):
+        if r.shape == "decision":
             lines.append(f"{r.id}{{{{{label}}}}}")
         else:
             lines.append(f"{r.id}[{label}]")
