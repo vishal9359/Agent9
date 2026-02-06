@@ -556,11 +556,11 @@ class FlowBuilder:
             if current:
                 segments.append(current)
 
-    for seg in segments:
+            for seg in segments:
                 text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in seg) if t)
                 label = summarize_block_with_llm(text)
                 line_count = len(text.splitlines()) if text else 1
-        n = self.new_node("process", label, text, line_count)
+                n = self.new_node("process", label, text, line_count)
 
                 if entry is None:
                     entry = n
