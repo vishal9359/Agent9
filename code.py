@@ -60,6 +60,10 @@ MAX_REGION_NODES = 5        # max CFG nodes to merge into one semantic region
 MAX_REGION_LINES = 25       # max source lines in a merged region (prevent over-collapsing)
 MIN_REGION_LINES = 3        # min lines to consider merging
 
+# NEW: Split long straight-line code into segments to avoid a single giant box
+PENDING_SEGMENT_MAX_LINES = 20
+PENDING_SEGMENT_MAX_STMTS = 6
+
 KEYWORD_TOKENS = {
     "if",
     "for",
@@ -214,6 +218,42 @@ def clean_condition_text(label: str) -> str:
     label = clean_unicode_chars(label or "")
     label = re.sub(r"^\s*(if|for|while|switch)\b", "", label, flags=re.IGNORECASE).strip()
     return clean_label_text(label, for_condition=True)
+
+
+def _is_code_like(label: str) -> bool:
+    """
+    Heuristic: detect labels that still read like code/textual statements.
+    """
+    l = (label or "").lower()
+    if re.search(r"\b\d+\b", l):
+        return True
+    if re.search(r"\b[a-z]\b", l):
+        return True
+    if any(w in l for w in ("initialize", "assign", "variable", "increment", "decrement")):
+        return True
+    return False
+
+
+def _rewrite_label_semantic(label: str) -> str:
+    """
+    Rephrase a label into a semantic purpose (short phrase).
+    Uses LLM but does not provide raw code (only the label).
+    """
+    prompt = (
+        "Rewrite this flowchart label to describe intent/purpose.\n"
+        "Rules:\n"
+        "- Output ONE short phrase (3 to 8 words)\n"
+        "- Remove variable names, constants, and code-like phrasing\n"
+        "- Focus on WHAT is achieved, not HOW\n"
+        "- No punctuation, ASCII only\n\n"
+        f"Label: {label}\n"
+        "Semantic label:"
+    )
+    try:
+        resp = llm.invoke([HumanMessage(prompt)])
+        return clean_label_text(resp.content)
+    except Exception:
+        return label
 
 
 def infer_role(label: str, code_text: str = "") -> SemanticRole:
@@ -490,17 +530,45 @@ class FlowBuilder:
             if not pending:
                 return
 
-            text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in pending) if t)
-            label = summarize_block_with_llm(text)
-            line_count = len(text.splitlines()) if text else 1
-            n = self.new_node("process", label, text, line_count)
+            # Split long straight-line code into smaller semantic segments
+            segments: list[list] = []
+            current: list = []
+            current_lines = 0
 
-            if entry is None:
-                entry = n
-            if curr_exits:
-                for ex in curr_exits:
-                    self.add_edge(ex, n)
-            curr_exits = [n]
+            for stmt in pending:
+                stmt_text = cursor_text(stmt, self.file_lines)
+                stmt_lines = max(1, len(stmt_text.splitlines())) if stmt_text else 1
+
+                if (
+                    current
+                    and (
+                        len(current) >= PENDING_SEGMENT_MAX_STMTS
+                        or (current_lines + stmt_lines) > PENDING_SEGMENT_MAX_LINES
+                    )
+                ):
+                    segments.append(current)
+                    current = []
+                    current_lines = 0
+
+                current.append(stmt)
+                current_lines += stmt_lines
+
+            if current:
+                segments.append(current)
+
+            for seg in segments:
+                text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in seg) if t)
+                label = summarize_block_with_llm(text)
+                line_count = len(text.splitlines()) if text else 1
+                n = self.new_node("process", label, text, line_count)
+
+                if entry is None:
+                    entry = n
+                if curr_exits:
+                    for ex in curr_exits:
+                        self.add_edge(ex, n)
+                curr_exits = [n]
+
             pending = []
 
         # Main walk
@@ -670,6 +738,16 @@ class FlowBuilder:
         return decision, [after]
 
 
+def _merge_group(role: SemanticRole) -> str:
+    """
+    Coarser grouping to reduce over-splitting.
+    INIT/COMPUTE/CALL are considered compatible and can merge.
+    """
+    if role in (SemanticRole.INIT, SemanticRole.COMPUTE, SemanticRole.CALL):
+        return "work"
+    return role.value
+
+
 def build_regions(graph: Graph) -> list[Region]:
     """
     NEW: Improved semantic region merging.
@@ -704,6 +782,7 @@ def build_regions(graph: Graph) -> list[Region]:
         node = graph.nodes[nid]
         role = node["role"]
         shape = node["shape"]
+        group = _merge_group(role)
 
         # Decision nodes: NEVER merge (single node region)
         if shape == "decision":
@@ -739,12 +818,13 @@ def build_regions(graph: Graph) -> list[Region]:
             nxt_node = graph.nodes.get(nxt, {})
             nxt_shape = nxt_node.get("shape", "")
             nxt_role = nxt_node.get("role", SemanticRole.COMPUTE)
+            nxt_group = _merge_group(nxt_role)
             nxt_lines = nxt_node.get("line_count", 0)
 
             # Stop conditions:
             if nxt_shape != "process":  # don't merge decisions
                 break
-            if nxt_role != role:  # role changed
+            if nxt_group != group:  # incompatible role group
                 break
             if indeg.get(nxt, 0) != 1:  # multiple incoming edges
                 break
@@ -781,7 +861,11 @@ def name_region_with_llm(region: Region, graph: Graph) -> str:
     labels = [graph.nodes[n]["label"] for n in region.nodes]
 
     if len(labels) == 1:
-        return labels[0]
+        label = labels[0]
+        if _is_code_like(label):
+            refined = _rewrite_label_semantic(label)
+            return refined or label
+        return label
 
     # For multi-node regions: get a semantic synthesis
     # NEW PROMPT: Focus on high-level goal
