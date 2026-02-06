@@ -452,6 +452,145 @@ class FlowBuilder:
             return n, [n]
         return entry, curr_exits
 
+    def _build_if(self, cursor) -> tuple[str, list[str]]:
+        children = list(cursor.get_children())
+        cond = children[0] if children else None
+        then_stmt = children[1] if len(children) > 1 else None
+        else_stmt = children[2] if len(children) > 2 else None
+
+        cond_label = clean_label_text(cursor_text(cond, self.file_lines) or "condition")
+        d = self.new_node("decision", f"Check {cond_label}")
+
+        t_entry, t_exits = self.build_compound(then_stmt)
+        self.add_edge(d, t_entry, "true")
+
+        if else_stmt:
+            f_entry, f_exits = self.build_compound(else_stmt)
+            self.add_edge(d, f_entry, "false")
+            return d, (t_exits + f_exits)
+
+        # no else: false falls through by returning decision node as an exit too
+        return d, (t_exits + [d])
+
+    def _build_loop(self, cursor) -> tuple[str, list[str]]:
+        k = cursor.kind
+        children = list(cursor.get_children())
+
+        cond = None
+        body = None
+        if k == cindex.CursorKind.WHILE_STMT:
+            cond = children[0] if len(children) > 0 else None
+            body = children[1] if len(children) > 1 else None
+        elif k == cindex.CursorKind.DO_STMT:
+            body = children[0] if len(children) > 0 else None
+            cond = children[1] if len(children) > 1 else None
+        else:  # FOR
+            cond = children[1] if len(children) > 1 else None
+            body = children[-1] if children else None
+
+        cond_label = clean_label_text(cursor_text(cond, self.file_lines) or "loop condition")
+        check = self.new_node("decision", f"Check {cond_label}")
+        after = self.new_node("process", "After loop")
+
+        self.loop_stack.append((check, after))
+        b_entry, b_exits = self.build_compound(body)
+        self.loop_stack.pop()
+
+        if k == cindex.CursorKind.DO_STMT:
+            entry = b_entry
+            for ex in b_exits:
+                self.add_edge(ex, check)
+            self.add_edge(check, b_entry, "true")
+            self.add_edge(check, after, "false")
+            return entry, [after]
+
+        self.add_edge(check, b_entry, "true")
+        self.add_edge(check, after, "false")
+        for ex in b_exits:
+            self.add_edge(ex, check)
+        return check, [after]
+
+    def _build_switch(self, cursor) -> tuple[str, list[str]]:
+        children = list(cursor.get_children())
+        expr = children[0] if children else None
+        body = children[1] if len(children) > 1 else None
+
+        expr_label = clean_label_text(cursor_text(expr, self.file_lines) or "expression")
+        d = self.new_node("decision", f"Switch on {expr_label}")
+        after = self.new_node("process", "After switch")
+
+        self.switch_stack.append(after)
+
+        cases = []
+        default_case = None
+        if body:
+            for ch in body.get_children():
+                if ch.kind == cindex.CursorKind.CASE_STMT:
+                    cases.append(ch)
+                elif ch.kind == cindex.CursorKind.DEFAULT_STMT:
+                    default_case = ch
+
+        built: list[tuple[str, str, list[str]]] = []
+        for c in cases:
+            raw = cursor_text(c, self.file_lines)
+            case_label = clean_label_text(raw.split(":")[0] if ":" in raw else "case")
+            c_children = list(c.get_children())
+            c_body = c_children[-1] if c_children else None
+            entry, exits = self.build_compound(c_body)
+            built.append((case_label, entry, exits))
+
+        if default_case:
+            d_children = list(default_case.get_children())
+            d_body = d_children[-1] if d_children else None
+            entry, exits = self.build_compound(d_body)
+            built.append(("default", entry, exits))
+
+        for lbl, entry, _ in built:
+            self.add_edge(d, entry, lbl)
+
+        # Best-effort fallthrough: connect exits to next case
+        for i in range(len(built) - 1):
+            next_entry = built[i + 1][1]
+            for ex in built[i][2]:
+                self.add_edge(ex, next_entry, "fallthrough")
+
+        if built:
+            for ex in built[-1][2]:
+                self.add_edge(ex, after)
+        else:
+            self.add_edge(d, after, "default")
+
+        self.switch_stack.pop()
+        return d, [after]
+
+    def _build_try(self, cursor) -> tuple[str, list[str]]:
+        children = list(cursor.get_children())
+        try_block = children[0] if children else None
+        catches = children[1:] if len(children) > 1 else []
+
+        # Some bindings expose catch blocks as CXX_CATCH_STMT nodes; filter if possible.
+        if CK_CXX_CATCH is not None:
+            catches = [c for c in catches if c.kind == CK_CXX_CATCH] or catches
+
+        decision = self.new_node("decision", "Exception occurs")
+        after = self.new_node("process", "After try catch")
+
+        t_entry, t_exits = self.build_compound(try_block)
+        self.add_edge(decision, t_entry, "no")
+        for ex in t_exits:
+            self.add_edge(ex, after)
+
+        if catches:
+            catch_text = "\n".join(t for t in (cursor_text(c, self.file_lines) for c in catches) if t)
+            catch_label = summarize_block_with_llm(catch_text) if catch_text else "Handle exception"
+            c_node = self.new_node("process", catch_label)
+            self.add_edge(decision, c_node, "yes")
+            self.add_edge(c_node, after)
+        else:
+            self.add_edge(decision, after, "yes")
+
+        return decision, [after]
+
 
 @dataclass
 class Region:
@@ -605,9 +744,9 @@ def render_abstract_mermaid(graph: Graph, regions: list[Region]) -> str:
         if key_nolbl in added:
             continue
         if elbl:
-            lines.append(f\"{rs} --> |{clean_label_text(elbl)}| {rd}\")
+            lines.append(f"{rs} --> |{clean_label_text(elbl)}| {rd}")
         else:
-            lines.append(f\"{rs} --> {rd}\")
+            lines.append(f"{rs} --> {rd}")
         added.add(key_nolbl)
 
     # Connect Start and End
@@ -617,145 +756,6 @@ def render_abstract_mermaid(graph: Graph, regions: list[Region]) -> str:
         lines.append(f"{s} --> End")
 
     return "\n".join(lines) + "\n"
-
-    def _build_if(self, cursor) -> tuple[str, list[str]]:
-        children = list(cursor.get_children())
-        cond = children[0] if children else None
-        then_stmt = children[1] if len(children) > 1 else None
-        else_stmt = children[2] if len(children) > 2 else None
-
-        cond_label = clean_label_text(cursor_text(cond, self.file_lines) or "condition")
-        d = self.new_node("decision", f"Check {cond_label}")
-
-        t_entry, t_exits = self.build_compound(then_stmt)
-        self.add_edge(d, t_entry, "true")
-
-        if else_stmt:
-            f_entry, f_exits = self.build_compound(else_stmt)
-            self.add_edge(d, f_entry, "false")
-            return d, (t_exits + f_exits)
-
-        # no else: false falls through by returning decision node as an exit too
-        return d, (t_exits + [d])
-
-    def _build_loop(self, cursor) -> tuple[str, list[str]]:
-        k = cursor.kind
-        children = list(cursor.get_children())
-
-        cond = None
-        body = None
-        if k == cindex.CursorKind.WHILE_STMT:
-            cond = children[0] if len(children) > 0 else None
-            body = children[1] if len(children) > 1 else None
-        elif k == cindex.CursorKind.DO_STMT:
-            body = children[0] if len(children) > 0 else None
-            cond = children[1] if len(children) > 1 else None
-        else:  # FOR
-            cond = children[1] if len(children) > 1 else None
-            body = children[-1] if children else None
-
-        cond_label = clean_label_text(cursor_text(cond, self.file_lines) or "loop condition")
-        check = self.new_node("decision", f"Check {cond_label}")
-        after = self.new_node("process", "After loop")
-
-        self.loop_stack.append((check, after))
-        b_entry, b_exits = self.build_compound(body)
-        self.loop_stack.pop()
-
-        if k == cindex.CursorKind.DO_STMT:
-            entry = b_entry
-            for ex in b_exits:
-                self.add_edge(ex, check)
-            self.add_edge(check, b_entry, "true")
-            self.add_edge(check, after, "false")
-            return entry, [after]
-
-        self.add_edge(check, b_entry, "true")
-        self.add_edge(check, after, "false")
-        for ex in b_exits:
-            self.add_edge(ex, check)
-        return check, [after]
-
-    def _build_switch(self, cursor) -> tuple[str, list[str]]:
-        children = list(cursor.get_children())
-        expr = children[0] if children else None
-        body = children[1] if len(children) > 1 else None
-
-        expr_label = clean_label_text(cursor_text(expr, self.file_lines) or "expression")
-        d = self.new_node("decision", f"Switch on {expr_label}")
-        after = self.new_node("process", "After switch")
-
-        self.switch_stack.append(after)
-
-        cases = []
-        default_case = None
-        if body:
-            for ch in body.get_children():
-                if ch.kind == cindex.CursorKind.CASE_STMT:
-                    cases.append(ch)
-                elif ch.kind == cindex.CursorKind.DEFAULT_STMT:
-                    default_case = ch
-
-        built: list[tuple[str, str, list[str]]] = []
-        for c in cases:
-            raw = cursor_text(c, self.file_lines)
-            case_label = clean_label_text(raw.split(":")[0] if ":" in raw else "case")
-            c_children = list(c.get_children())
-            c_body = c_children[-1] if c_children else None
-            entry, exits = self.build_compound(c_body)
-            built.append((case_label, entry, exits))
-
-        if default_case:
-            d_children = list(default_case.get_children())
-            d_body = d_children[-1] if d_children else None
-            entry, exits = self.build_compound(d_body)
-            built.append(("default", entry, exits))
-
-        for lbl, entry, _ in built:
-            self.add_edge(d, entry, lbl)
-
-        # Best-effort fallthrough: connect exits to next case
-        for i in range(len(built) - 1):
-            next_entry = built[i + 1][1]
-            for ex in built[i][2]:
-                self.add_edge(ex, next_entry, "fallthrough")
-
-        if built:
-            for ex in built[-1][2]:
-                self.add_edge(ex, after)
-        else:
-            self.add_edge(d, after, "default")
-
-        self.switch_stack.pop()
-        return d, [after]
-
-    def _build_try(self, cursor) -> tuple[str, list[str]]:
-        children = list(cursor.get_children())
-        try_block = children[0] if children else None
-        catches = children[1:] if len(children) > 1 else []
-
-        # Some bindings expose catch blocks as CXX_CATCH_STMT nodes; filter if possible.
-        if CK_CXX_CATCH is not None:
-            catches = [c for c in catches if c.kind == CK_CXX_CATCH] or catches
-
-        decision = self.new_node("decision", "Exception occurs")
-        after = self.new_node("process", "After try catch")
-
-        t_entry, t_exits = self.build_compound(try_block)
-        self.add_edge(decision, t_entry, "no")
-        for ex in t_exits:
-            self.add_edge(ex, after)
-
-        if catches:
-            catch_text = "\n".join(t for t in (cursor_text(c, self.file_lines) for c in catches) if t)
-            catch_label = summarize_block_with_llm(catch_text) if catch_text else "Handle exception"
-            c_node = self.new_node("process", catch_label)
-            self.add_edge(decision, c_node, "yes")
-            self.add_edge(c_node, after)
-        else:
-            self.add_edge(decision, after, "yes")
-
-        return decision, [after]
 
 
 def render_mermaid(graph: Graph) -> str:
