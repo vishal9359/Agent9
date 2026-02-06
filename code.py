@@ -56,13 +56,13 @@ MAX_LABEL_CHARS = 80        # max label length in Mermaid
 MAX_SUMMARY_RETRIES = 3     # per block summary
 
 # NEW: Semantic grouping parameters
-MAX_REGION_NODES = 5        # max CFG nodes to merge into one semantic region
-MAX_REGION_LINES = 25       # max source lines in a merged region (prevent over-collapsing)
+MAX_REGION_NODES = 6        # max CFG nodes to merge into one semantic region
+MAX_REGION_LINES = 30       # max source lines in a merged region (prevent over-collapsing)
 MIN_REGION_LINES = 3        # min lines to consider merging
 
 # NEW: Split long straight-line code into segments to avoid a single giant box
-PENDING_SEGMENT_MAX_LINES = 20
-PENDING_SEGMENT_MAX_STMTS = 6
+PENDING_SEGMENT_MAX_LINES = 25
+PENDING_SEGMENT_MAX_STMTS = 10
 
 KEYWORD_TOKENS = {
     "if",
@@ -556,11 +556,11 @@ class FlowBuilder:
             if current:
                 segments.append(current)
 
-            for seg in segments:
+    for seg in segments:
                 text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in seg) if t)
                 label = summarize_block_with_llm(text)
                 line_count = len(text.splitlines()) if text else 1
-                n = self.new_node("process", label, text, line_count)
+        n = self.new_node("process", label, text, line_count)
 
                 if entry is None:
                     entry = n
@@ -738,14 +738,30 @@ class FlowBuilder:
         return decision, [after]
 
 
-def _merge_group(role: SemanticRole) -> str:
+def _can_merge_regions(curr_node: dict, next_node: dict, total_lines: int) -> bool:
     """
-    Coarser grouping to reduce over-splitting.
-    INIT/COMPUTE/CALL are considered compatible and can merge.
+    Decide if two consecutive PROCESS nodes can be merged.
+    Merges are liberal for straight-line code, but we stop at
+    finalize/error boundaries to keep important steps explicit.
     """
-    if role in (SemanticRole.INIT, SemanticRole.COMPUTE, SemanticRole.CALL):
-        return "work"
-    return role.value
+    if not curr_node or not next_node:
+        return False
+    if curr_node.get("shape") != "process" or next_node.get("shape") != "process":
+        return False
+
+    curr_role = curr_node.get("role", SemanticRole.COMPUTE)
+    next_role = next_node.get("role", SemanticRole.COMPUTE)
+
+    if curr_role in (SemanticRole.ERROR, SemanticRole.FINALIZE):
+        return False
+    if next_role in (SemanticRole.ERROR, SemanticRole.FINALIZE):
+        return False
+
+    next_lines = next_node.get("line_count", 0)
+    if total_lines + next_lines > MAX_REGION_LINES:
+        return False
+
+    return True
 
 
 def build_regions(graph: Graph) -> list[Region]:
@@ -775,6 +791,14 @@ def build_regions(graph: Graph) -> list[Region]:
     # Sort nodes by topological order (approximate: by node ID)
     sorted_nodes = sorted(graph.nodes.keys(), key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
 
+    process_nodes = [n for n in sorted_nodes if graph.nodes.get(n, {}).get("shape") == "process"]
+    # Adaptive limits: if straight-line code is long, allow slightly larger regions
+    adaptive_max_nodes = MAX_REGION_NODES
+    adaptive_max_lines = MAX_REGION_LINES
+    if len(process_nodes) >= 20:
+        adaptive_max_nodes = min(10, MAX_REGION_NODES + 2)
+        adaptive_max_lines = min(45, MAX_REGION_LINES + 10)
+
     for nid in sorted_nodes:
         if nid in visited:
             continue
@@ -782,7 +806,6 @@ def build_regions(graph: Graph) -> list[Region]:
         node = graph.nodes[nid]
         role = node["role"]
         shape = node["shape"]
-        group = _merge_group(role)
 
         # Decision nodes: NEVER merge (single node region)
         if shape == "decision":
@@ -805,7 +828,7 @@ def build_regions(graph: Graph) -> list[Region]:
         total_lines = node.get("line_count", 0)
         curr = nid
 
-        while len(chain) < MAX_REGION_NODES:
+        while len(chain) < adaptive_max_nodes:
             # Check if we can merge forward
             nxts = out.get(curr, [])
             if len(nxts) != 1:  # branching or end
@@ -817,18 +840,14 @@ def build_regions(graph: Graph) -> list[Region]:
 
             nxt_node = graph.nodes.get(nxt, {})
             nxt_shape = nxt_node.get("shape", "")
-            nxt_role = nxt_node.get("role", SemanticRole.COMPUTE)
-            nxt_group = _merge_group(nxt_role)
             nxt_lines = nxt_node.get("line_count", 0)
 
             # Stop conditions:
             if nxt_shape != "process":  # don't merge decisions
                 break
-            if nxt_group != group:  # incompatible role group
-                break
             if indeg.get(nxt, 0) != 1:  # multiple incoming edges
                 break
-            if total_lines + nxt_lines > MAX_REGION_LINES:  # too big
+            if not _can_merge_regions(graph.nodes.get(curr), nxt_node, total_lines):
                 break
 
             # Merge
