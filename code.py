@@ -68,6 +68,19 @@ KEYWORD_TOKENS = {
     "reinterpret_cast",
 }
 
+# Common library/API calls to ignore in flowchart labels
+COMMON_API_CALLS = {
+    "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
+    "memcpy", "memmove", "memcmp", "memset",
+    "printf", "fprintf", "sprintf", "snprintf", "scanf", "fscanf", "sscanf",
+    "puts", "fputs", "putchar", "getchar",
+    "malloc", "calloc", "realloc", "free",
+    "exit", "abort",
+    "cout", "cin", "cerr", "clog",
+    "push_back", "emplace_back", "insert", "erase", "find", "size", "empty",
+    "begin", "end", "clear", "resize", "reserve",
+}
+
 
 def _ck(name: str):
     """
@@ -80,6 +93,7 @@ def _ck(name: str):
 # CursorKind compatibility (varies by libclang version / python bindings)
 CK_CXX_TRY = _ck("CXX_TRY_STMT") or _ck("TRY_STMT")
 CK_CXX_CATCH = _ck("CXX_CATCH_STMT")
+CK_CXX_FOR_RANGE = _ck("CXX_FOR_RANGE_STMT")
 
 
 def is_cpp_file(path: str) -> bool:
@@ -214,10 +228,29 @@ def extract_function_calls_from_text(text: str) -> list[str]:
     for m in matches:
         if m in keywords:
             continue
+        if m in COMMON_API_CALLS:
+            continue
         if m not in seen:
             out.append(m)
             seen.add(m)
     return out
+
+
+def _append_calls_to_label(label: str, calls: list[str]) -> str:
+    """
+    Ensure custom function calls are explicitly shown in the label.
+    """
+    if not calls:
+        return label
+
+    l = (label or "").lower()
+    missing = [c for c in calls if c.lower() not in l]
+    if not missing:
+        return label
+
+    call_text = ", ".join(f"call {c}" for c in missing[:3])
+    merged = f"{label}; {call_text}" if label else call_text
+    return clamp_label(clean_label_text(merged))
 
 
 def summarize_block_with_llm(block_text: str) -> str:
@@ -229,15 +262,18 @@ def summarize_block_with_llm(block_text: str) -> str:
     if not block_text:
         return "Process block"
 
+    calls = extract_function_calls_from_text(block_text)
     lines = block_text.splitlines()
     if len(lines) > MAX_BLOCK_LINES:
         parts: list[str] = []
         for i in range(0, len(lines), MAX_BLOCK_LINES):
             chunk = "\n".join(lines[i : i + MAX_BLOCK_LINES]).strip()
             parts.append(_summarize_once(chunk))
-        return clamp_label(" / ".join(parts)) or "Process block"
+        summary = clamp_label(" / ".join(parts)) or "Process block"
+        return _append_calls_to_label(summary, calls)
 
-    return _summarize_once(block_text)
+    summary = _summarize_once(block_text)
+    return _append_calls_to_label(summary, calls)
 
 
 def _summarize_once(block_text: str) -> str:
@@ -362,6 +398,9 @@ class FlowBuilder:
         if k in (cindex.CursorKind.FOR_STMT, cindex.CursorKind.WHILE_STMT, cindex.CursorKind.DO_STMT):
             return self._build_loop(cursor)
 
+        if CK_CXX_FOR_RANGE is not None and k == CK_CXX_FOR_RANGE:
+            return self._build_range_for(cursor)
+
         if k == cindex.CursorKind.SWITCH_STMT:
             return self._build_switch(cursor)
 
@@ -394,6 +433,7 @@ class FlowBuilder:
             cindex.CursorKind.FOR_STMT,
             cindex.CursorKind.WHILE_STMT,
             cindex.CursorKind.DO_STMT,
+            CK_CXX_FOR_RANGE,
             cindex.CursorKind.SWITCH_STMT,
             CK_CXX_TRY,
             cindex.CursorKind.RETURN_STMT,
@@ -524,6 +564,28 @@ class FlowBuilder:
             self.add_edge(check, b_entry, "true")
             self.add_edge(check, after, "false")
             return entry, [after]
+
+        self.add_edge(check, b_entry, "true")
+        self.add_edge(check, after, "false")
+        for ex in b_exits:
+            self.add_edge(ex, check)
+        return check, [after]
+
+    def _build_range_for(self, cursor) -> tuple[str, list[str]]:
+        children = list(cursor.get_children())
+        body = children[-1] if children else None
+
+        header_text = cursor_text(cursor, self.file_lines)
+        match = re.search(r"for\s*\(([^)]*)\)", header_text)
+        cond_text = match.group(1) if match else "range"
+        cond_label = clean_condition_text(cond_text)
+
+        check = self.new_node("decision", f"For each {cond_label}")
+        after = self.new_node("process", "After loop")
+
+        self.loop_stack.append((check, after))
+        b_entry, b_exits = self.build_compound(body)
+        self.loop_stack.pop()
 
         self.add_edge(check, b_entry, "true")
         self.add_edge(check, after, "false")
