@@ -75,10 +75,12 @@ COMMON_API_CALLS = {
     "printf", "fprintf", "sprintf", "snprintf", "scanf", "fscanf", "sscanf",
     "puts", "fputs", "putchar", "getchar",
     "malloc", "calloc", "realloc", "free",
+    "memset",
     "exit", "abort",
     "cout", "cin", "cerr", "clog",
     "push_back", "emplace_back", "insert", "erase", "find", "size", "empty",
     "begin", "end", "clear", "resize", "reserve",
+    "move", "sort",
 }
 
 
@@ -241,16 +243,16 @@ def _append_calls_to_label(label: str, calls: list[str]) -> str:
     Ensure custom function calls are explicitly shown in the label.
     """
     if not calls:
-        return label
+        return clean_label_text(label)
 
-    l = (label or "").lower()
-    missing = [c for c in calls if c.lower() not in l]
+    base = clean_label_text(label)
+    missing = [c for c in calls if not re.search(rf"\b{re.escape(c)}\b", base, flags=re.IGNORECASE)]
     if not missing:
-        return label
+        return base
 
     call_text = ", ".join(f"call {c}" for c in missing[:3])
-    merged = f"{label}; {call_text}" if label else call_text
-    return clamp_label(clean_label_text(merged))
+    merged = f"{base}; {call_text}" if base else call_text
+    return clamp_label(merged)
 
 
 def summarize_block_with_llm(block_text: str) -> str:
@@ -336,6 +338,7 @@ class FlowBuilder:
         self._next_id = 1
         self.loop_stack: list[tuple[str, str]] = []  # (continue_target, break_target)
         self.switch_stack: list[str] = []  # break_target
+        self.terminal_exits: list[str] = []
 
     def new_node(self, shape: str, label: str) -> str:
         nid = f"n{self._next_id}"
@@ -369,6 +372,8 @@ class FlowBuilder:
         self.add_edge("Start", entry)
         for ex in exits:
             self.add_edge(ex, "End")
+        for ex in self.terminal_exits:
+            self.add_edge(ex, "End")
         return Graph(self.nodes, self.edges)
 
     def build_stmt(self, cursor) -> tuple[str, list[str]]:
@@ -376,6 +381,7 @@ class FlowBuilder:
 
         if k == cindex.CursorKind.RETURN_STMT:
             n = self.new_node("process", "Return from function")
+            self.terminal_exits.append(n)
             return n, []
 
         if k == cindex.CursorKind.BREAK_STMT:
@@ -396,6 +402,9 @@ class FlowBuilder:
             return self._build_if(cursor)
 
         if k in (cindex.CursorKind.FOR_STMT, cindex.CursorKind.WHILE_STMT, cindex.CursorKind.DO_STMT):
+            header_text = cursor_text(cursor, self.file_lines)
+            if k == cindex.CursorKind.FOR_STMT and re.search(r"for\s*\([^)]*:[^)]*\)", header_text):
+                return self._build_range_for(cursor)
             return self._build_loop(cursor)
 
         if CK_CXX_FOR_RANGE is not None and k == CK_CXX_FOR_RANGE:
