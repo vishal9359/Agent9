@@ -46,7 +46,7 @@ llm = ChatOllama(model="gpt-oss", temperature=0.2, top_k=10, top_p=0.9)
 
 # Chunking/safety limits
 MAX_BLOCK_LINES = 80        # max lines per LLM block summary
-MAX_LABEL_CHARS = 80        # max label length in Mermaid
+MAX_LABEL_CHARS = 160       # max label length in Mermaid
 MAX_SUMMARY_RETRIES = 3     # per block summary
 
 # Split long straight-line code into segments to avoid a single giant box
@@ -106,7 +106,10 @@ def _kind_str(kind) -> str:
 
 
 def _is_range_for_cursor(cursor) -> bool:
-    return "FOR_RANGE" in _kind_str(getattr(cursor, "kind", ""))
+    if cursor is None:
+        return False
+    k = _kind_str(getattr(cursor, "kind", ""))
+    return ("FOR_RANGE" in k) or ("CXX_FOR_RANGE" in k)
 
 
 def is_cpp_file(path: str) -> bool:
@@ -154,7 +157,7 @@ def _replace_function_calls(text: str, for_condition: bool) -> str:
         name = match.group(1)
         if name in KEYWORD_TOKENS:
             return name
-        return name if for_condition else f"call {name}"
+        return f"{name}()"
 
     # Method calls: obj.method(...) or ptr->method(...)
     def repl_method(match: re.Match) -> str:
@@ -162,7 +165,8 @@ def _replace_function_calls(text: str, for_condition: bool) -> str:
         method = match.group(2)
         if method in KEYWORD_TOKENS:
             return f"{obj} {method}"
-        return f"{obj} {method}" if for_condition else f"call {method}"
+        # Prefer just the method name as a black-box call.
+        return f"{method}()"
 
     text = re.sub(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\.|->)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)", repl_method, text)
     text = re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)", repl, text)
@@ -178,31 +182,16 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     """
     label = clean_unicode_chars(label or "")
 
-    # Avoid "call call Foo" when model outputs "call Foo(...)".
-    if not for_condition:
-        label = re.sub(r"\bcall\s+([A-Za-z_][A-Za-z0-9_:]*)\s*\(", r"\1(", label)
-
-    # Replace function-call syntax
+    # Replace function-call syntax first (turn Foo(...) into Foo()).
     label = _replace_function_calls(label, for_condition=for_condition)
 
-    if for_condition:
-        # Replace operators with words (avoid Mermaid parse issues in decisions)
-        label = (
-            label.replace("!=", " not equal ")
-            .replace("==", " equal ")
-            .replace(">=", " greater or equal ")
-            .replace("<=", " less or equal ")
-            .replace("&&", " and ")
-            .replace("||", " or ")
-            .replace(">", " greater ")
-            .replace("<", " less ")
-        )
-    else:
-        # Keep pseudo-code operators but normalize boolean ops
-        label = label.replace("&&", " and ").replace("||", " or ")
+    # Keep operators for conditions and process labels (user requested x<0, y>=0, etc.)
+    # Only normalize boolean ops for readability.
+    label = label.replace("&&", " and ").replace("||", " or ")
 
-    # Remove punctuation/brackets that can break Mermaid parsing
-    label = re.sub(r"[{}()\[\];:]", " ", label)
+    # Remove brackets/braces/statement terminators that can break Mermaid parsing.
+    # Keep parentheses so calls like Foo() remain visible.
+    label = re.sub(r"[{}\[\];]", " ", label)
     label = label.replace("?", " ")
 
     label = re.sub(r"\s+", " ", label).strip()
@@ -216,6 +205,7 @@ def clean_condition_text(label: str) -> str:
     """
     label = clean_unicode_chars(label or "")
     label = re.sub(r"^\s*(if|for|while|switch)\b", "", label, flags=re.IGNORECASE).strip()
+    # Keep operators and function-call parentheses in conditions
     return clean_label_text(label, for_condition=True)
 
 
@@ -265,7 +255,7 @@ def _append_calls_to_label(label: str, calls: list[str]) -> str:
     if not missing:
         return base
 
-    call_text = ", ".join(f"call {c}" for c in missing[:3])
+    call_text = ", ".join(f"{c}()" for c in missing[:3])
     merged = f"{base}; {call_text}" if base else call_text
     return clamp_label(merged)
 
@@ -313,7 +303,7 @@ def _summarize_once(block_text: str) -> str:
         "Rules:\n"
         "- Output 1 to 3 short pseudo-code lines separated by '<br/>'\n"
         "- Keep important assignments and calls\n"
-        "- If calling functions, use 'call <name>'\n"
+        "- If calling functions, use '<name>()'\n"
         "- Do NOT output control-flow keywords (if/for/while/switch/try/catch)\n"
         "- Avoid long prose; keep it close to code\n"
         "- ASCII only\n"
@@ -522,6 +512,11 @@ class FlowBuilder:
                 return False
             if _is_range_for_cursor(c):
                 return True
+            # Some bindings represent range-for as FOR_STMT only; detect via text.
+            if c.kind == cindex.CursorKind.FOR_STMT:
+                ht = cursor_text(c, self.file_lines)
+                if re.search(r"for\s*\([^)]*:[^)]*\)", ht):
+                    return True
             return c.kind in CONTROL_KINDS
 
         def flush_pending():
@@ -634,10 +629,22 @@ class FlowBuilder:
             body = children[0] if len(children) > 0 else None
             cond = children[1] if len(children) > 1 else None
         else:  # FOR
-            cond = children[1] if len(children) > 1 else None
+            # Prefer parsing header text to avoid including init/inc in the condition label.
+            header_text = cursor_text(cursor, self.file_lines)
+            m = re.search(r"for\s*\(([^)]*)\)", header_text)
+            if m and ";" in m.group(1):
+                parts = [p.strip() for p in m.group(1).split(";")]
+                if len(parts) >= 2:
+                    cond_text = parts[1]
+                    cond = None
+                else:
+                    cond_text = ""
+            else:
+                cond_text = ""
+                cond = children[1] if len(children) > 1 else None
             body = children[-1] if children else None
 
-        cond_text = cursor_text(cond, self.file_lines) or "loop condition"
+        cond_text = (cond_text or cursor_text(cond, self.file_lines) or "loop condition").strip()
         cond_label = clean_condition_text(cond_text)
         check = self.new_node("decision", f"Check {cond_label}")
         after = self.new_node("process", "After loop")
