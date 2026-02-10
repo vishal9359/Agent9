@@ -46,7 +46,7 @@ llm = ChatOllama(model="gpt-oss", temperature=0.2, top_k=10, top_p=0.9)
 
 # Chunking/safety limits
 MAX_BLOCK_LINES = 80        # max lines per LLM block summary
-MAX_LABEL_CHARS = 80        # max label length in Mermaid
+MAX_LABEL_CHARS = 120       # max label length in Mermaid
 MAX_SUMMARY_RETRIES = 3     # per block summary
 
 # Split long straight-line code into segments to avoid a single giant box
@@ -75,12 +75,11 @@ COMMON_API_CALLS = {
     "printf", "fprintf", "sprintf", "snprintf", "scanf", "fscanf", "sscanf",
     "puts", "fputs", "putchar", "getchar",
     "malloc", "calloc", "realloc", "free",
-    "memset",
     "exit", "abort",
     "cout", "cin", "cerr", "clog",
     "push_back", "emplace_back", "insert", "erase", "find", "size", "empty",
     "begin", "end", "clear", "resize", "reserve",
-    "move", "sort",
+    "move",
 }
 
 
@@ -170,6 +169,9 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     # Replace function-call syntax
     label = _replace_function_calls(label, for_condition=for_condition)
 
+    # Collapse repeated "call" tokens
+    label = re.sub(r"\bcall\s+call\b", "call", label, flags=re.IGNORECASE)
+
     if for_condition:
         # Replace operators with words (avoid Mermaid parse issues in decisions)
         label = (
@@ -255,6 +257,17 @@ def _append_calls_to_label(label: str, calls: list[str]) -> str:
     return clamp_label(merged)
 
 
+def _label_from_code(block_text: str) -> str:
+    """
+    Build a compact pseudo-code label directly from code lines.
+    """
+    if not block_text:
+        return "Process block"
+    lines = [l.strip() for l in block_text.splitlines() if l.strip()]
+    short = "; ".join(lines[:3])
+    return clamp_label(clean_label_text(short)) or "Process block"
+
+
 def summarize_block_with_llm(block_text: str) -> str:
     """
     Summarize a block into a short phrase. Chunk deterministically if too large.
@@ -275,7 +288,13 @@ def summarize_block_with_llm(block_text: str) -> str:
         return _append_calls_to_label(summary, calls)
 
     summary = _summarize_once(block_text)
-    return _append_calls_to_label(summary, calls)
+    summary = _append_calls_to_label(summary, calls)
+
+    # If the summary is too vague, fall back to compact code-based label
+    if summary.lower() in ("process block", "process"):
+        return _label_from_code(block_text)
+
+    return summary
 
 
 def _summarize_once(block_text: str) -> str:
@@ -451,6 +470,12 @@ class FlowBuilder:
         }
         CONTROL_KINDS = {k for k in CONTROL_KINDS if k is not None}
 
+        def first_control_child(node):
+            for ch in node.get_children():
+                if ch.kind in CONTROL_KINDS:
+                    return ch
+            return None
+
         def flush_pending():
             nonlocal entry, curr_exits, pending
             if not pending:
@@ -498,9 +523,10 @@ class FlowBuilder:
 
         # Main walk
         for child in children:
-            if child.kind in CONTROL_KINDS:
+            control_child = child if child.kind in CONTROL_KINDS else first_control_child(child)
+            if control_child is not None:
                 flush_pending()
-                s_entry, s_exits = self.build_stmt(child)
+                s_entry, s_exits = self.build_stmt(control_child)
 
                 if entry is None:
                     entry = s_entry
