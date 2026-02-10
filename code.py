@@ -44,6 +44,14 @@ out_dir = "/home/workspace/adk/gemma-code/orchestrator/docs"
 # LLM (open-source) via Ollama
 llm = ChatOllama(model="gpt-oss", temperature=0.2, top_k=10, top_p=0.9)
 
+# Debug/progress logging (set via --verbose)
+VERBOSE = False
+
+
+def log(msg: str):
+    if VERBOSE:
+        print(msg, flush=True)
+
 # Chunking/safety limits
 MAX_BLOCK_LINES = 80        # max lines per LLM block summary
 MAX_LABEL_CHARS = 160       # max label length in Mermaid
@@ -188,6 +196,7 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     # Keep operators for conditions and process labels (user requested x<0, y>=0, etc.)
     # Only normalize boolean ops for readability.
     label = label.replace("&&", " and ").replace("||", " or ")
+    label = label.replace("->", ".")
 
     # Remove brackets/braces/statement terminators that can break Mermaid parsing.
     # Keep parentheses so calls like Foo() remain visible.
@@ -620,14 +629,17 @@ class FlowBuilder:
         k = cursor.kind
         children = list(cursor.get_children())
 
+        cond_text = ""
         cond = None
         body = None
         if k == cindex.CursorKind.WHILE_STMT:
             cond = children[0] if len(children) > 0 else None
             body = children[1] if len(children) > 1 else None
+            cond_text = cursor_text(cond, self.file_lines)
         elif k == cindex.CursorKind.DO_STMT:
             body = children[0] if len(children) > 0 else None
             cond = children[1] if len(children) > 1 else None
+            cond_text = cursor_text(cond, self.file_lines)
         else:  # FOR
             # Prefer parsing header text to avoid including init/inc in the condition label.
             header_text = cursor_text(cursor, self.file_lines)
@@ -640,8 +652,8 @@ class FlowBuilder:
                 else:
                     cond_text = ""
             else:
-                cond_text = ""
                 cond = children[1] if len(children) > 1 else None
+                cond_text = cursor_text(cond, self.file_lines)
             body = children[-1] if children else None
 
         cond_text = (cond_text or cursor_text(cond, self.file_lines) or "loop condition").strip()
@@ -875,6 +887,7 @@ def generate_function_description(function_lines: list[str]) -> str:
 def extract_node_info(fn_cursor, file_path: str, module_name: str, root_dir: str) -> Optional[dict]:
     extent = fn_cursor.extent
     try:
+        log(f"[INFO] Function: {fn_cursor.spelling} ({file_path}:{extent.start.line}-{extent.end.line})")
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             file_lines = f.readlines()
 
@@ -961,6 +974,7 @@ def generate_word_document(data: list[dict], doc_name: str):
 
 def parse_file(index, file_path: str, root_dir: str, compile_args: list[str], out_nodes: dict, out_edges):
     module_name = get_module_name(file_path, root_dir)
+    log(f"[INFO] Parsing file: {file_path}")
     tu = index.parse(
         file_path,
         args=compile_args,
@@ -1013,10 +1027,14 @@ def main():
     parser.add_argument("path", help="C++ codebase root directory")
     parser.add_argument("--std", default="c++17", help="C++ standard, e.g. c++17, c++20")
     parser.add_argument("--libclang", help="Path to libclang shared library")
+    parser.add_argument("--verbose", action="store_true", help="Print progress while processing files/functions")
     args = parser.parse_args()
 
     if args.libclang:
         cindex.Config.set_library_file(args.libclang)
+
+    global VERBOSE
+    VERBOSE = bool(args.verbose)
 
     os.makedirs(out_dir, exist_ok=True)
     parse_codebase(args.path, compile_args=[f"-std={args.std}"])
