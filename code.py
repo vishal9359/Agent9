@@ -46,7 +46,7 @@ llm = ChatOllama(model="gpt-oss", temperature=0.2, top_k=10, top_p=0.9)
 
 # Chunking/safety limits
 MAX_BLOCK_LINES = 80        # max lines per LLM block summary
-MAX_LABEL_CHARS = 120       # max label length in Mermaid
+MAX_LABEL_CHARS = 80        # max label length in Mermaid
 MAX_SUMMARY_RETRIES = 3     # per block summary
 
 # Split long straight-line code into segments to avoid a single giant box
@@ -75,11 +75,12 @@ COMMON_API_CALLS = {
     "printf", "fprintf", "sprintf", "snprintf", "scanf", "fscanf", "sscanf",
     "puts", "fputs", "putchar", "getchar",
     "malloc", "calloc", "realloc", "free",
+    "memset",
     "exit", "abort",
     "cout", "cin", "cerr", "clog",
     "push_back", "emplace_back", "insert", "erase", "find", "size", "empty",
     "begin", "end", "clear", "resize", "reserve",
-    "move",
+    "move", "sort",
 }
 
 
@@ -95,6 +96,17 @@ def _ck(name: str):
 CK_CXX_TRY = _ck("CXX_TRY_STMT") or _ck("TRY_STMT")
 CK_CXX_CATCH = _ck("CXX_CATCH_STMT")
 CK_CXX_FOR_RANGE = _ck("CXX_FOR_RANGE_STMT")
+
+
+def _kind_str(kind) -> str:
+    """
+    Best-effort kind name across clang bindings.
+    """
+    return (getattr(kind, "name", None) or getattr(kind, "spelling", None) or str(kind) or "").upper()
+
+
+def _is_range_for_cursor(cursor) -> bool:
+    return "FOR_RANGE" in _kind_str(getattr(cursor, "kind", ""))
 
 
 def is_cpp_file(path: str) -> bool:
@@ -166,11 +178,12 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     """
     label = clean_unicode_chars(label or "")
 
+    # Avoid "call call Foo" when model outputs "call Foo(...)".
+    if not for_condition:
+        label = re.sub(r"\bcall\s+([A-Za-z_][A-Za-z0-9_:]*)\s*\(", r"\1(", label)
+
     # Replace function-call syntax
     label = _replace_function_calls(label, for_condition=for_condition)
-
-    # Collapse repeated "call" tokens
-    label = re.sub(r"\bcall\s+call\b", "call", label, flags=re.IGNORECASE)
 
     if for_condition:
         # Replace operators with words (avoid Mermaid parse issues in decisions)
@@ -257,18 +270,7 @@ def _append_calls_to_label(label: str, calls: list[str]) -> str:
     return clamp_label(merged)
 
 
-def _label_from_code(block_text: str) -> str:
-    """
-    Build a compact pseudo-code label directly from code lines.
-    """
-    if not block_text:
-        return "Process block"
-    lines = [l.strip() for l in block_text.splitlines() if l.strip()]
-    short = "; ".join(lines[:3])
-    return clamp_label(clean_label_text(short)) or "Process block"
-
-
-def summarize_block_with_llm(block_text: str) -> str:
+def summarize_block_with_llm(block_text: str, extra_calls: Optional[list[str]] = None) -> str:
     """
     Summarize a block into a short phrase. Chunk deterministically if too large.
     The LLM never sees the whole function, only small blocks.
@@ -278,6 +280,10 @@ def summarize_block_with_llm(block_text: str) -> str:
         return "Process block"
 
     calls = extract_function_calls_from_text(block_text)
+    if extra_calls:
+        for c in extra_calls:
+            if c and c not in calls:
+                calls.append(c)
     lines = block_text.splitlines()
     if len(lines) > MAX_BLOCK_LINES:
         parts: list[str] = []
@@ -288,13 +294,7 @@ def summarize_block_with_llm(block_text: str) -> str:
         return _append_calls_to_label(summary, calls)
 
     summary = _summarize_once(block_text)
-    summary = _append_calls_to_label(summary, calls)
-
-    # If the summary is too vague, fall back to compact code-based label
-    if summary.lower() in ("process block", "process"):
-        return _label_from_code(block_text)
-
-    return summary
+    return _append_calls_to_label(summary, calls)
 
 
 def _summarize_once(block_text: str) -> str:
@@ -304,18 +304,18 @@ def _summarize_once(block_text: str) -> str:
     calls = extract_function_calls_from_text(block_text)
     calls_str = ", ".join(calls[:10]) if calls else "none"
 
-    # Prompt: compact pseudo-code with minimal text
+    # Prompt: pseudo-code + minimal intent (avoid over-gist)
     prompt = (
         "You are analyzing C++ code for a flowchart.\n"
-        "Goal: Produce a short, readable pseudo-code label for a process box.\n"
+        "Goal: Produce a short label for a PROCESS box.\n"
+        "Prefer pseudo-code (assignments + calls) with minimal intent words.\n"
         "\n"
         "Rules:\n"
-        "- Output ONE short line (5 to 14 words)\n"
-        "- Use simple pseudo-code with minimal text\n"
-        "- Keep variable names and small expressions when helpful\n"
-        "- Combine consecutive steps into one label\n"
+        "- Output 1 to 3 short pseudo-code lines separated by '<br/>'\n"
+        "- Keep important assignments and calls\n"
         "- If calling functions, use 'call <name>'\n"
-        "- Avoid long explanations or prose\n"
+        "- Do NOT output control-flow keywords (if/for/while/switch/try/catch)\n"
+        "- Avoid long prose; keep it close to code\n"
         "- ASCII only\n"
         "\n"
         f"Function calls detected: {calls_str}\n"
@@ -350,14 +350,57 @@ class FlowBuilder:
     Basic blocks = grouped consecutive non-control statements.
     """
 
-    def __init__(self, file_lines: list[str]):
+    def __init__(self, file_lines: list[str], root_dir: str, file_path: str):
         self.file_lines = file_lines
+        self.root_dir = os.path.abspath(root_dir or "")
+        self.file_path = os.path.abspath(file_path or "")
         self.nodes: dict[str, dict] = {}
         self.edges: list[tuple[str, str, str]] = []
         self._next_id = 1
         self.loop_stack: list[tuple[str, str]] = []  # (continue_target, break_target)
         self.switch_stack: list[str] = []  # break_target
         self.terminal_exits: list[str] = []
+
+    def _is_under_root(self, path: str) -> bool:
+        if not path or not self.root_dir:
+            return False
+        try:
+            p = os.path.normcase(os.path.abspath(path))
+            r = os.path.normcase(os.path.abspath(self.root_dir))
+            return os.path.commonpath([p, r]) == r
+        except Exception:
+            return False
+
+    def _collect_custom_calls(self, cursor) -> list[str]:
+        """
+        Collect callees whose definitions are inside the parsed project root.
+        This avoids hardcoding API names and makes "custom call" detection robust.
+        """
+        out: list[str] = []
+        seen = set()
+        if cursor is None:
+            return out
+
+        stack = [cursor]
+        while stack:
+            n = stack.pop()
+            try:
+                kname = _kind_str(getattr(n, "kind", ""))
+                if "CALL_EXPR" in kname:
+                    ref = getattr(n, "referenced", None)
+                    ref_file = None
+                    if ref is not None and getattr(ref, "location", None) is not None and getattr(ref.location, "file", None) is not None:
+                        ref_file = ref.location.file.name
+                    if ref_file and self._is_under_root(ref_file):
+                        name = (getattr(ref, "spelling", None) or getattr(n, "spelling", None) or "").strip()
+                        if name and name not in seen:
+                            out.append(name)
+                            seen.add(name)
+                for ch in n.get_children():
+                    stack.append(ch)
+            except Exception:
+                continue
+        return out
 
     def new_node(self, shape: str, label: str) -> str:
         nid = f"n{self._next_id}"
@@ -397,6 +440,9 @@ class FlowBuilder:
 
     def build_stmt(self, cursor) -> tuple[str, list[str]]:
         k = cursor.kind
+
+        if _is_range_for_cursor(cursor):
+            return self._build_range_for(cursor)
 
         if k == cindex.CursorKind.RETURN_STMT:
             n = self.new_node("process", "Return from function")
@@ -448,7 +494,8 @@ class FlowBuilder:
 
         if cursor.kind != cindex.CursorKind.COMPOUND_STMT:
             text = cursor_text(cursor, self.file_lines)
-            n = self.new_node("process", summarize_block_with_llm(text))
+            calls = self._collect_custom_calls(cursor)
+            n = self.new_node("process", summarize_block_with_llm(text, extra_calls=calls))
             return n, [n]
 
         children = list(cursor.get_children())
@@ -470,11 +517,12 @@ class FlowBuilder:
         }
         CONTROL_KINDS = {k for k in CONTROL_KINDS if k is not None}
 
-        def first_control_child(node):
-            for ch in node.get_children():
-                if ch.kind in CONTROL_KINDS:
-                    return ch
-            return None
+        def _is_control_stmt(c) -> bool:
+            if c is None:
+                return False
+            if _is_range_for_cursor(c):
+                return True
+            return c.kind in CONTROL_KINDS
 
         def flush_pending():
             nonlocal entry, curr_exits, pending
@@ -509,7 +557,14 @@ class FlowBuilder:
 
             for seg in segments:
                 text = "\n".join(t for t in (cursor_text(s, self.file_lines) for s in seg) if t)
-                label = summarize_block_with_llm(text)
+                seg_calls: list[str] = []
+                seen_calls = set()
+                for s in seg:
+                    for cname in self._collect_custom_calls(s):
+                        if cname not in seen_calls:
+                            seg_calls.append(cname)
+                            seen_calls.add(cname)
+                label = summarize_block_with_llm(text, extra_calls=seg_calls)
                 n = self.new_node("process", label)
 
                 if entry is None:
@@ -523,10 +578,9 @@ class FlowBuilder:
 
         # Main walk
         for child in children:
-            control_child = child if child.kind in CONTROL_KINDS else first_control_child(child)
-            if control_child is not None:
+            if _is_control_stmt(child):
                 flush_pending()
-                s_entry, s_exits = self.build_stmt(control_child)
+                s_entry, s_exits = self.build_stmt(child)
 
                 if entry is None:
                     entry = s_entry
@@ -751,7 +805,7 @@ def validate_mermaid(mermaid: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-def generate_flowchart_for_function(fn_cursor, file_lines: list[str]):
+def generate_flowchart_for_function(fn_cursor, file_lines: list[str], root_dir: str, file_path: str):
     """
     Generate flowcharts for a function.
     
@@ -763,7 +817,7 @@ def generate_flowchart_for_function(fn_cursor, file_lines: list[str]):
     feedback = None
 
     # Build CFG
-    builder = FlowBuilder(file_lines)
+    builder = FlowBuilder(file_lines, root_dir=root_dir, file_path=file_path)
     graph = builder.build_function(fn_cursor)
 
     mermaid = render_mermaid(graph)
@@ -811,7 +865,7 @@ def generate_function_description(function_lines: list[str]) -> str:
         return "Description generation failed"
 
 
-def extract_node_info(fn_cursor, file_path: str, module_name: str) -> Optional[dict]:
+def extract_node_info(fn_cursor, file_path: str, module_name: str, root_dir: str) -> Optional[dict]:
     extent = fn_cursor.extent
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -822,7 +876,7 @@ def extract_node_info(fn_cursor, file_path: str, module_name: str) -> Optional[d
         if not function_lines:
             return None
 
-        flowchart, img, feedback = generate_flowchart_for_function(fn_cursor, file_lines)
+        flowchart, img, feedback = generate_flowchart_for_function(fn_cursor, file_lines, root_dir=root_dir, file_path=file_path)
 
         return {
             "uid": node_uid(fn_cursor),
@@ -845,7 +899,7 @@ def extract_node_info(fn_cursor, file_path: str, module_name: str) -> Optional[d
         return None
 
 
-def visit(cursor, file_path: str, module_name: str, nodes: dict, call_edges, current_fn_uid: Optional[str], visited=None):
+def visit(cursor, file_path: str, module_name: str, root_dir: str, nodes: dict, call_edges, current_fn_uid: Optional[str], visited=None):
     if visited is None:
         visited = set()
 
@@ -865,7 +919,7 @@ def visit(cursor, file_path: str, module_name: str, nodes: dict, call_edges, cur
         visited.add(fqn)
         uid = node_uid(cursor)
         if uid not in nodes and cursor.spelling:
-            info = extract_node_info(cursor, file_path, module_name)
+            info = extract_node_info(cursor, file_path, module_name, root_dir=root_dir)
             if info:
                 nodes[uid] = info
                 current_fn_uid = uid
@@ -877,7 +931,7 @@ def visit(cursor, file_path: str, module_name: str, nodes: dict, call_edges, cur
             call_edges[current_fn_uid].add(callee_uid)
 
     for child in cursor.get_children():
-        visit(child, file_path, module_name, nodes, call_edges, current_fn_uid, visited)
+        visit(child, file_path, module_name, root_dir, nodes, call_edges, current_fn_uid, visited)
 
 
 def generate_word_document(data: list[dict], doc_name: str):
@@ -908,7 +962,7 @@ def parse_file(index, file_path: str, root_dir: str, compile_args: list[str], ou
 
     my_nodes: dict = {}
     my_edges = defaultdict(set)
-    visit(tu.cursor, file_path, module_name, my_nodes, my_edges, None)
+    visit(tu.cursor, file_path, module_name, root_dir, my_nodes, my_edges, None)
 
     if not my_nodes:
         return
