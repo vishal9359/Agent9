@@ -266,14 +266,9 @@ def _apply_nbsp_around_assignment_ops(label: str) -> str:
     """
     In multi-line labels, prevent ugly wrap around '=' using non-breaking spaces.
     """
-    if not label or "<br/>" not in label:
-        return label
-    lines = label.split("<br/>")
-    fixed = []
-    for ln in lines:
-        ln2 = re.sub(r"(?<![=!<>])\s=\s(?![=])", "#160;=#160;", ln)
-        fixed.append(ln2)
-    return "<br/>".join(fixed)
+    # Disabled by design: requirements specify using entity codes only for brackets,
+    # not for whitespace. Keep plain ASCII spaces around '='.
+    return label
 
 
 def clean_label_text(label: str, for_condition: bool = False) -> str:
@@ -294,7 +289,6 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     label = re.sub(r"\s+", " ", label).strip()
     label = label.replace(br, "<br/>")
 
-    label = _apply_nbsp_around_assignment_ops(label)
     label = _escape_mermaid_chars(label)
 
     return clamp_label(label) or "Process block"
@@ -493,6 +487,37 @@ def _extract_call_expressions(stmt: str) -> list[str]:
     return uniq
 
 
+_ASSIGN_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_:\.\[\]]*)\s*=\s*(.+)$"
+)
+
+
+def _simplify_pseudocode_statement(stmt: str) -> str:
+    """
+    Apply pseudo-code rules to a single statement (best-effort):
+    - If it's an assignment with a call on RHS, prefer showing the RHS call only.
+    - Keep increments, indexing, arithmetic, and plain assignments as-is.
+    """
+    s = clean_unicode_chars(stmt or "").strip()
+    if not s:
+        return ""
+
+    # Do not touch comparisons or compound operators here.
+    if "==" in s or ">=" in s or "<=" in s or "!=" in s:
+        return s
+
+    m = _ASSIGN_RE.match(s)
+    if m:
+        rhs = m.group(2).strip()
+        rhs = _normalize_member_calls(rhs)
+        calls = _extract_call_expressions(rhs)
+        if calls:
+            return calls[0]
+        return s
+
+    return s
+
+
 def build_pseudocode_label(block_text: str) -> str:
     """
     Deterministic pseudo-code label builder (no LLM).
@@ -502,13 +527,17 @@ def build_pseudocode_label(block_text: str) -> str:
         return "Process block"
 
     stmts: list[str] = []
+    had_lambda_def = False
     for s in _split_statements(block_text):
         s2 = s.strip()
         if not s2:
             continue
         if _looks_like_lambda_definition(s2):
+            had_lambda_def = True
+            # Keep a short marker only if this is the only thing in the block.
             s2 = _compress_lambda_definition(s2)
         s2 = _simplify_decl_assign(s2)
+        s2 = _simplify_pseudocode_statement(s2)
         s2 = s2.strip()
         if s2:
             stmts.append(s2)
@@ -526,7 +555,9 @@ def build_pseudocode_label(block_text: str) -> str:
     for s in filtered:
         calls.extend(_extract_call_expressions(_normalize_member_calls(s)))
 
-    if calls and (len(filtered) > len(calls) or any(_looks_like_lambda_definition(x) for x in stmts)):
+    # Special case: blocks that define a lambda and then call something.
+    # Drop the lambda definition from the label and show the call(s).
+    if had_lambda_def and calls:
         label = "<br/>".join(calls[:4])
         if len(calls) > 4:
             label += "<br/>..."
@@ -723,7 +754,8 @@ class FlowBuilder:
 
         if k == cindex.CursorKind.RETURN_STMT:
             return_text = cursor_text(cursor, self.file_lines).strip()
-            return_expr = re.sub(r"^\s*return\s+", "", return_text, flags=re.IGNORECASE).strip()
+            # Handle `return;` (no whitespace) as well as `return expr;`
+            return_expr = re.sub(r"^\s*return\b", "", return_text, flags=re.IGNORECASE).strip()
             return_expr = re.sub(r";+\s*$", "", return_expr).strip()
             label = f"return {return_expr}".strip() if return_expr else "return"
             n = self.new_node("process", label)
@@ -1313,7 +1345,7 @@ _GLOBAL_NO_DESC = False
 
 def main():
     parser = argparse.ArgumentParser(description="Generate AST-driven flowcharts for C++ functions")
-    parser.add_argument("path", help="C++ codebase root directory OR a single .cpp/.c file")
+    parser.add_argument("--path", required=True, help="C++ codebase root directory OR a single .cpp/.c file")
     parser.add_argument("--std", default="c++17", help="C++ standard, e.g. c++17, c++20")
 
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="Output directory for json/docx/images")
