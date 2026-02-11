@@ -251,9 +251,12 @@ def _normalize_member_calls(text: str) -> str:
         return text
 
     # Only rewrite when it's clearly a call (followed by '(').
+    # Prefer just the function name for calls (cleaner flowchart labels):
+    #   obj->Method(x) -> Method(x)
+    #   obj.Method(x)  -> Method(x)
     return re.sub(
         r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
-        r"\1.<\2>(",
+        r"\2(",
         text,
     )
 
@@ -392,12 +395,16 @@ def build_pseudocode_label(block_text: str) -> str:
     def is_simple_assign(x: str) -> bool:
         return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_:\.]*\s*=\s*.+$", x)) and ("==" not in x)
 
-    if 2 <= len(stmts) <= 4 and all(is_simple_assign(x) for x in stmts):
-        label = "<br/>".join(stmts[:4])
-    else:
-        label = " ; ".join(stmts[:6])
+    # Prefer multi-line pseudo-code for readability
+    if 2 <= len(stmts) <= 6:
+        label = "<br/>".join(stmts[:6])
         if len(stmts) > 6:
-            label += " ; ..."
+            label += "<br/>..."
+    else:
+        # Keep even large blocks readable: first few statements as separate lines
+        label = "<br/>".join(stmts[:6])
+        if len(stmts) > 6:
+            label += "<br/>..."
     return clean_label_text(label)
 
 
@@ -412,26 +419,26 @@ class BatchLLMLabeler:
         self.enabled = bool(enabled and llm and HumanMessage)
         self.cache: dict[str, str] = {}
 
-    def label_many(self, blocks: list[tuple[str, str]]) -> dict[str, str]:
+    def label_many(self, blocks: list[tuple[str, str, str]]) -> dict[str, str]:
         out: dict[str, str] = {}
         if not blocks:
             return out
 
-        remaining: list[tuple[str, str]] = []
-        for bid, txt in blocks:
+        remaining: list[tuple[str, str, str]] = []
+        for bid, base_label, txt in blocks:
             key = re.sub(r"\s+", " ", clean_unicode_chars(txt or "")).strip()
             if key in self.cache:
                 out[bid] = self.cache[key]
             else:
-                remaining.append((bid, txt))
+                remaining.append((bid, base_label, txt))
 
         if not remaining or not self.enabled:
-            for bid, txt in remaining:
-                out[bid] = build_pseudocode_label(txt)
+            for bid, base_label, _txt in remaining:
+                out[bid] = clean_label_text(base_label)
             return out
 
         # Chunk to keep prompts sane
-        chunk: list[tuple[str, str]] = []
+        chunk: list[tuple[str, str, str]] = []
         chunk_chars = 0
 
         def flush_chunk():
@@ -439,41 +446,44 @@ class BatchLLMLabeler:
             if not chunk:
                 return
             mapping = self._invoke_chunk(chunk)
-            for bid, txt in chunk:
+            for bid, base_label, txt in chunk:
                 key = re.sub(r"\s+", " ", clean_unicode_chars(txt or "")).strip()
-                lbl = mapping.get(bid) or build_pseudocode_label(txt)
+                # If LLM fails for any block, keep deterministic base label.
+                lbl = mapping.get(bid) or base_label
                 lbl = clean_label_text(lbl)
                 out[bid] = lbl
                 self.cache[key] = lbl
             chunk = []
             chunk_chars = 0
 
-        for bid, txt in remaining:
+        for bid, base_label, txt in remaining:
             t = clean_unicode_chars(txt or "")[:MAX_BLOCK_CHARS_FOR_NODE]
             if chunk and (chunk_chars + len(t) > 9000):
                 flush_chunk()
-            chunk.append((bid, t))
-            chunk_chars += len(t)
+            chunk.append((bid, base_label, t))
+            chunk_chars += len(t) + len(base_label)
 
         flush_chunk()
         return out
 
-    def _invoke_chunk(self, chunk: list[tuple[str, str]]) -> dict[str, str]:
+    def _invoke_chunk(self, chunk: list[tuple[str, str, str]]) -> dict[str, str]:
         blocks_txt = []
-        for bid, txt in chunk:
-            blocks_txt.append(f"### BLOCK {bid}\n{txt}\n")
+        for bid, base_label, txt in chunk:
+            blocks_txt.append(f"### BLOCK {bid}\nBASE_LABEL:\n{base_label}\nCODE:\n{txt}\n")
 
         prompt = (
             "You generate PROCESS-box labels for a C++ flowchart.\n"
             "Return STRICT JSON object mapping block ids to labels.\n"
-            "Labels must be pseudo-code close to the code.\n"
+            "Goal: do a *minimal* rewrite of BASE_LABEL so it reads cleanly (pseudo-code + tiny natural language if needed).\n"
             "Rules per label:\n"
-            "- one line only (no newlines)\n"
+            "- must be based on BASE_LABEL; do NOT invent anything not present in CODE\n"
+            "- you may keep multiple lines by using literal '<br/>' (do NOT output real newlines)\n"
             "- keep assignments and calls; include call parameters\n"
             "- do NOT invent variables/conditions\n"
             "- do NOT include control-flow keywords (if/for/while/switch/try/catch)\n"
-            "- keep <= 140 chars\n"
-            "- separate multiple statements with '; '\n"
+            "- keep <= 180 chars\n"
+            "- separate statements with '<br/>' (not semicolons)\n"
+            "- keep function calls as name(args) (do not drop parentheses)\n"
             "\n"
             "Blocks:\n"
             f"{''.join(blocks_txt)}\n"
@@ -516,7 +526,8 @@ class FlowBuilder:
         self.switch_stack: list[str] = []  # break_target
         self.terminal_exits: list[str] = []
 
-        self._block_requests: list[tuple[str, str]] = []  # (node_id, raw_block_text)
+        # (node_id, deterministic_base_label, raw_block_text)
+        self._block_requests: list[tuple[str, str, str]] = []
 
     def new_node(self, shape: str, label: str) -> str:
         nid = f"n{self._next_id}"
@@ -533,7 +544,8 @@ class FlowBuilder:
         self.nodes[nid] = {"shape": "process", "label": det}
 
         if self.labeler and self.labeler.enabled:
-            self._block_requests.append((nid, raw))
+            # LLM will only lightly rewrite this deterministic label.
+            self._block_requests.append((nid, det, raw))
         return nid
 
     def add_edge(self, src: str, dst: str, label: str = ""):
