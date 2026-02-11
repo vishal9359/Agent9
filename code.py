@@ -240,6 +240,42 @@ def _simplify_decl_assign(stmt: str) -> str:
     return f"{m.group(1)} = {m.group(2).strip()}"
 
 
+_DECL_CTOR_RE = re.compile(
+    r"^\s*(?:const\s+)?(?:static\s+)?(?:inline\s+)?(?:volatile\s+)?"
+    r"(?:unsigned\s+|signed\s+|long\s+|short\s+)?"
+    r"[A-Za-z_][A-Za-z0-9_:<>]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*$",
+    flags=re.DOTALL,
+)
+
+
+def _simplify_decl_ctor(stmt: str) -> str:
+    """
+    Convert constructor-style declarations into pseudo-code:
+      `Type var(args)` -> `var(args)`
+    Drops the type (including templates) which is usually noise in flowcharts.
+    """
+    s = clean_unicode_chars(stmt or "").strip()
+    m = _DECL_CTOR_RE.match(s)
+    if not m:
+        return stmt
+    name = m.group(1)
+    args = re.sub(r"\s+", " ", (m.group(2) or "").strip())
+    return f"{name}({args})"
+
+
+_PRESERVE_MEMBER_CONTEXT = {
+    # Container/iterator calls where object context matters for clarity
+    "size",
+    "begin",
+    "end",
+    "erase",
+    "push_back",
+    "push_front",
+    "insert",
+    "find",
+}
+
+
 def _normalize_member_calls(text: str) -> str:
     """
     Normalize member-function calls into a Mermaid-friendly pseudo form:
@@ -253,13 +289,17 @@ def _normalize_member_calls(text: str) -> str:
     if not text:
         return text
 
+    def repl(match: re.Match) -> str:
+        obj = match.group(1)
+        method = match.group(2)
+        if method in _PRESERVE_MEMBER_CONTEXT:
+            return f"{obj}.{method}("
+        return f"{method}("
+
     # Only rewrite when it's clearly a call (followed by '(').
-    # Prefer just the function name for calls (cleaner flowchart labels):
-    #   obj->Method(x) -> Method(x)
-    #   obj.Method(x)  -> Method(x)
     return re.sub(
         r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
-        r"\2(",
+        repl,
         text,
     )
 
@@ -367,6 +407,85 @@ def cursor_text(cursor, file_lines: list[str]) -> str:
         return ""
     return "\n".join(extract_source_lines(file_lines, cursor.extent.start.line, cursor.extent.end.line)).strip()
 
+
+def _extract_paren_group_after(keyword: str, text: str) -> str:
+    """
+    Extract the parenthesized group that follows a keyword, handling nested ().
+    Example: for (a=begin(); b!=end(); ++b) -> returns "a=begin(); b!=end(); ++b"
+    """
+    if not text:
+        return ""
+    m = re.search(rf"\b{re.escape(keyword)}\b", text)
+    if not m:
+        return ""
+    i = m.end()
+    n = len(text)
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n or text[i] != "(":
+        return ""
+    i += 1
+    depth = 1
+    start = i
+    in_str = False
+    str_ch = ""
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == str_ch:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            str_ch = ch
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+        i += 1
+    return ""
+
+
+def _split_top_level_semicolons(s: str) -> list[str]:
+    """Split a string by ';' at depth 0 (handles nested ()/[]/{})."""
+    if not s:
+        return []
+    out: list[str] = []
+    depth = 0
+    curr: list[str] = []
+    in_str = False
+    str_ch = ""
+    for ch in s:
+        if in_str:
+            curr.append(ch)
+            if ch == str_ch:
+                in_str = False
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            str_ch = ch
+            curr.append(ch)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == ";" and depth == 0:
+            part = "".join(curr).strip()
+            if part:
+                out.append(part)
+            curr = []
+            continue
+        curr.append(ch)
+    tail = "".join(curr).strip()
+    if tail:
+        out.append(tail)
+    return out
 
 _LAMBDA_DEF_RE = re.compile(
     r"(?s)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[[^\]]*\]\s*(?:\([^)]*\))?\s*\{"
@@ -512,6 +631,10 @@ def _simplify_pseudocode_statement(stmt: str) -> str:
     if m:
         rhs = m.group(2).strip()
         rhs = _normalize_member_calls(rhs)
+        # If RHS is a member-context call like container.begin()/end()/size(),
+        # keep the full assignment for clarity (pseudo-code).
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\.(?:begin|end|size)\s*\(", rhs):
+            return s
         calls = _extract_call_expressions(rhs)
         if calls:
             return calls[0]
@@ -538,6 +661,7 @@ def build_pseudocode_label(block_text: str) -> str:
             had_lambda_def = True
             # Keep a short marker only if this is the only thing in the block.
             s2 = _compress_lambda_definition(s2)
+        s2 = _simplify_decl_ctor(s2)
         s2 = _simplify_decl_assign(s2)
         s2 = _simplify_pseudocode_statement(s2)
         s2 = s2.strip()
@@ -627,7 +751,12 @@ class BatchLLMLabeler:
             for bid, base_label, txt in chunk:
                 key = re.sub(r"\s+", " ", clean_unicode_chars(base_label or "")).strip()
                 # If LLM fails for any block, keep deterministic base label.
-                lbl = mapping.get(bid) or base_label
+                proposed = mapping.get(bid) or base_label
+                # Guardrail: do not allow the LLM to drop statement lines.
+                if base_label.count("<br/>") and proposed.count("<br/>") < base_label.count("<br/>"):
+                    lbl = base_label
+                else:
+                    lbl = proposed
                 lbl = clean_label_text(lbl)
                 out[bid] = lbl
                 self.cache[key] = lbl
@@ -667,6 +796,7 @@ class BatchLLMLabeler:
             "Rules per label:\n"
             "- must be based on BASE_LABEL; do NOT invent anything\n"
             "- you may keep multiple lines by using literal '<br/>' (do NOT output real newlines)\n"
+            "- do NOT delete any statement line from BASE_LABEL; keep the same number of '<br/>' separated lines\n"
             "- keep assignments and calls; include call parameters\n"
             "- do NOT invent variables/conditions\n"
             "- do NOT include control-flow keywords (if/for/while/switch/try/catch)\n"
@@ -964,9 +1094,9 @@ class FlowBuilder:
             cond_text = cursor_extent_text(cond, self.file_lines) or cursor_text(cond, self.file_lines)
         else:  # FOR
             header_text = cursor_text(cursor, self.file_lines)
-            m = re.search(r"for\s*\(([^)]*)\)", header_text)
-            if m and ";" in m.group(1):
-                parts = [p.strip() for p in m.group(1).split(";")]
+            inside = _extract_paren_group_after("for", header_text)
+            if inside and ";" in inside:
+                parts = [p.strip() for p in _split_top_level_semicolons(inside)]
                 cond_text = parts[1] if len(parts) >= 2 else ""
                 cond = None
             else:
@@ -1003,8 +1133,8 @@ class FlowBuilder:
         body = children[-1] if children else None
 
         header_text = cursor_text(cursor, self.file_lines)
-        match = re.search(r"for\s*\(([^)]*)\)", header_text)
-        cond_text = match.group(1) if match else "item : range"
+        inside = _extract_paren_group_after("for", header_text)
+        cond_text = inside if inside else "item : range"
         cond_label = clean_condition_text(cond_text)
 
         check = self.new_node("decision", f"for each {cond_label}" if cond_label else "for each item")
