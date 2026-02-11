@@ -26,20 +26,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from clang import cindex
-
-try:
-    from langchain.messages import HumanMessage
-    from langchain_ollama import ChatOllama
-except Exception:  # pragma: no cover
-    HumanMessage = None
-    ChatOllama = None
-
-try:
-    from docx import Document
-    from docx.shared import Inches
-except Exception:  # pragma: no cover
-    Document = None
-    Inches = None
+from langchain.messages import HumanMessage
+from langchain_ollama import ChatOllama
+from docx import Document
+from docx.shared import Inches
 
 
 SUPPORTED_EXT = (".c", ".cpp", ".cc", ".cxx")
@@ -47,12 +37,23 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MERMAID_DIR = os.path.join(BASE_DIR, "mermaid_converter")
 DEFAULT_OUT_DIR = os.path.join(BASE_DIR, "docs")
 
-VERBOSE = False
+VERBOSE = True
+
+# Mandatory libclang configuration (per requirements)
+DEFAULT_LIBCLANG_PATH = "/usr/lib/llvm-18/lib/libclang.so"
+try:
+    cindex.Config.set_library_file(DEFAULT_LIBCLANG_PATH)
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        f"Failed to configure libclang at {DEFAULT_LIBCLANG_PATH}. "
+        "Install LLVM 18 libclang at that path (or adjust the code if your environment differs). "
+        f"Original error: {e}"
+    )
 
 
 def log(msg: str):
-    if VERBOSE:
-        print(msg, flush=True)
+    # Mandatory progress output (per requirements)
+    print(msg, flush=True)
 
 
 # Labeling limits
@@ -1163,38 +1164,22 @@ def main():
     parser = argparse.ArgumentParser(description="Generate AST-driven flowcharts for C++ functions")
     parser.add_argument("path", help="C++ codebase root directory OR a single .cpp/.c file")
     parser.add_argument("--std", default="c++17", help="C++ standard, e.g. c++17, c++20")
-    parser.add_argument("--libclang", help="Path to libclang shared library")
-    parser.add_argument("--verbose", action="store_true", help="Print progress while processing files/functions")
 
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="Output directory for json/docx/images")
     parser.add_argument("--mermaid-dir", default=DEFAULT_MERMAID_DIR, help="Directory containing index.js renderer")
-    parser.add_argument("--llm-labels", action="store_true", help="Enable batched LLM label compression")
     parser.add_argument("--no-desc", action="store_true", help="Skip function description generation")
     parser.add_argument("--ollama-model", default="gpt-oss", help="Ollama model name (default: gpt-oss)")
     args = parser.parse_args()
 
-    if args.libclang:
-        cindex.Config.set_library_file(args.libclang)
-
     global VERBOSE, _GLOBAL_OUT_DIR, _GLOBAL_MERMAID_DIR, _GLOBAL_LLM, _GLOBAL_LABELER, _GLOBAL_NO_DESC
-    VERBOSE = bool(args.verbose)
+    VERBOSE = True
     _GLOBAL_OUT_DIR = os.path.abspath(args.out_dir)
     _GLOBAL_MERMAID_DIR = os.path.abspath(args.mermaid_dir) if args.mermaid_dir else ""
     _GLOBAL_NO_DESC = bool(args.no_desc)
 
-    if ChatOllama and args.llm_labels:
-        try:
-            _GLOBAL_LLM = ChatOllama(model=args.ollama_model, temperature=0.1, top_k=10, top_p=0.9)
-        except Exception:
-            _GLOBAL_LLM = None
-    elif ChatOllama and not _GLOBAL_NO_DESC:
-        # LLM only for descriptions
-        try:
-            _GLOBAL_LLM = ChatOllama(model=args.ollama_model, temperature=0.2, top_k=10, top_p=0.9)
-        except Exception:
-            _GLOBAL_LLM = None
-
-    _GLOBAL_LABELER = BatchLLMLabeler(_GLOBAL_LLM, enabled=bool(args.llm_labels))
+    # Mandatory batched LLM labeler (per requirements)
+    _GLOBAL_LLM = ChatOllama(model=args.ollama_model, temperature=0.1, top_k=10, top_p=0.9)
+    _GLOBAL_LABELER = BatchLLMLabeler(_GLOBAL_LLM, enabled=True)
 
     os.makedirs(_GLOBAL_OUT_DIR, exist_ok=True)
     parse_codebase(args.path, compile_args=[f"-std={args.std}"])
