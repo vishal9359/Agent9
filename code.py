@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
@@ -371,6 +372,127 @@ def cursor_text(cursor, file_lines: list[str]) -> str:
     return "\n".join(extract_source_lines(file_lines, cursor.extent.start.line, cursor.extent.end.line)).strip()
 
 
+_LAMBDA_DEF_RE = re.compile(
+    r"(?s)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[[^\]]*\]\s*(?:\([^)]*\))?\s*\{"
+)
+
+
+def _looks_like_lambda_definition(stmt: str) -> bool:
+    if not stmt:
+        return False
+    return bool(re.search(r"(?s)\=\s*\[[^\]]*\]\s*(?:\([^)]*\))?\s*\{", stmt))
+
+
+def _compress_lambda_definition(stmt: str) -> str:
+    """
+    Avoid dumping the full lambda body into a flowchart label.
+    Convert `auto helper = [&](int x){ return x*2; };` -> `helper = lambda`.
+    """
+    s = clean_unicode_chars(stmt or "").strip()
+    if not _looks_like_lambda_definition(s):
+        return s
+    m = _LAMBDA_DEF_RE.search(s)
+    if m:
+        name = m.group(1)
+        return f"{name} = lambda"
+    return "lambda"
+
+
+_NOISE_STMT_RE = re.compile(
+    r"^\s*(?:std::)?(?:cout|cerr|clog)\s*<<|"
+    r"\b(?:printf|fprintf|sprintf|snprintf|puts|putchar|getchar|perror)\s*\(",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_noise_statement(stmt: str) -> bool:
+    """
+    Statements that usually add noise to control-flow flowcharts.
+    Keep this conservative: only obvious I/O.
+    """
+    if not stmt:
+        return True
+    return bool(_NOISE_STMT_RE.search(stmt))
+
+
+def _extract_call_expressions(stmt: str) -> list[str]:
+    """
+    Extract call expressions like `foo(x, y)` from a statement.
+    Best-effort, not a full C++ parser.
+    """
+    s = clean_unicode_chars(stmt or "")
+    out: list[str] = []
+
+    i = 0
+    n = len(s)
+    in_str = False
+    str_ch = ""
+
+    def is_ident_char(ch: str) -> bool:
+        return ch.isalnum() or ch == "_" or ch == ":"
+
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == str_ch:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            str_ch = ch
+            i += 1
+            continue
+
+        if (ch.isalpha() or ch == "_") and (i == 0 or not is_ident_char(s[i - 1])):
+            j = i + 1
+            while j < n and is_ident_char(s[j]):
+                j += 1
+            name = s[i:j]
+            k = j
+            while k < n and s[k].isspace():
+                k += 1
+            if k < n and s[k] == "(" and name not in KEYWORD_TOKENS:
+                depth = 0
+                t = k
+                in_str2 = False
+                str_ch2 = ""
+                while t < n:
+                    c2 = s[t]
+                    if in_str2:
+                        if c2 == str_ch2:
+                            in_str2 = False
+                        t += 1
+                        continue
+                    if c2 in ("'", '"'):
+                        in_str2 = True
+                        str_ch2 = c2
+                        t += 1
+                        continue
+                    if c2 == "(":
+                        depth += 1
+                    elif c2 == ")":
+                        depth -= 1
+                        if depth == 0:
+                            out.append(s[i : t + 1].strip())
+                            i = t + 1
+                            break
+                    t += 1
+                else:
+                    i = j
+                    continue
+                continue
+        i += 1
+
+    seen = set()
+    uniq: list[str] = []
+    for c in out:
+        if c not in seen:
+            uniq.append(c)
+            seen.add(c)
+    return uniq
+
+
 def build_pseudocode_label(block_text: str) -> str:
     """
     Deterministic pseudo-code label builder (no LLM).
@@ -384,6 +506,8 @@ def build_pseudocode_label(block_text: str) -> str:
         s2 = s.strip()
         if not s2:
             continue
+        if _looks_like_lambda_definition(s2):
+            s2 = _compress_lambda_definition(s2)
         s2 = _simplify_decl_assign(s2)
         s2 = s2.strip()
         if s2:
@@ -392,18 +516,23 @@ def build_pseudocode_label(block_text: str) -> str:
     if not stmts:
         return clean_label_text(re.sub(r"\s+", " ", block_text).strip()) or "Process block"
 
-    def is_simple_assign(x: str) -> bool:
-        return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_:\.]*\s*=\s*.+$", x)) and ("==" not in x)
+    # Filter obvious noise (e.g. cout << ...)
+    filtered = [s for s in stmts if not _is_noise_statement(s)]
+    if not filtered:
+        filtered = stmts
 
-    # Prefer multi-line pseudo-code for readability
-    if 2 <= len(stmts) <= 6:
-        label = "<br/>".join(stmts[:6])
-        if len(stmts) > 6:
+    # If there are meaningful calls in this block, prefer showing calls only.
+    calls: list[str] = []
+    for s in filtered:
+        calls.extend(_extract_call_expressions(_normalize_member_calls(s)))
+
+    if calls and (len(filtered) > len(calls) or any(_looks_like_lambda_definition(x) for x in stmts)):
+        label = "<br/>".join(calls[:4])
+        if len(calls) > 4:
             label += "<br/>..."
     else:
-        # Keep even large blocks readable: first few statements as separate lines
-        label = "<br/>".join(stmts[:6])
-        if len(stmts) > 6:
+        label = "<br/>".join(filtered[:6])
+        if len(filtered) > 6:
             label += "<br/>..."
     return clean_label_text(label)
 
@@ -490,7 +619,11 @@ class BatchLLMLabeler:
             "JSON:"
         )
         try:
+            log("[LLM] Prompt:\n" + prompt)
+            t0 = time.perf_counter()
             resp = self.llm.invoke([HumanMessage(prompt)])
+            dt = time.perf_counter() - t0
+            log(f"[LLM] Completed in {dt:.3f}s")
             content = (resp.content or "").strip()
             data = json.loads(content)
             if isinstance(data, dict):
@@ -990,7 +1123,11 @@ def generate_function_description(function_lines: list[str]) -> str:
     )
     query = prompt.format(function="\n".join(function_lines[:120]))
     try:
+        log("[LLM] Description prompt:\n" + query)
+        t0 = time.perf_counter()
         resp = _GLOBAL_LLM.invoke([HumanMessage(query)])
+        dt = time.perf_counter() - t0
+        log(f"[LLM] Description completed in {dt:.3f}s")
         return clean_unicode_chars(resp.content).strip()
     except Exception:
         return ""
@@ -999,6 +1136,7 @@ def generate_function_description(function_lines: list[str]) -> str:
 def extract_node_info(fn_cursor, file_path: str, module_name: str, root_dir: str) -> Optional[dict]:
     extent = fn_cursor.extent
     try:
+        fn_t0 = time.perf_counter()
         log(f"[INFO] Function: {fn_cursor.spelling} ({file_path}:{extent.start.line}-{extent.end.line})")
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             file_lines = f.readlines()
@@ -1012,7 +1150,7 @@ def extract_node_info(fn_cursor, file_path: str, module_name: str, root_dir: str
             fn_cursor, file_lines, root_dir=root_dir, file_path=file_path
         )
 
-        return {
+        result = {
             "uid": node_uid(fn_cursor),
             "name": fn_cursor.spelling,
             "line_start": extent.start.line,
@@ -1028,6 +1166,9 @@ def extract_node_info(fn_cursor, file_path: str, module_name: str, root_dir: str
             "callees": [],
             "callers": [],
         }
+        fn_dt = time.perf_counter() - fn_t0
+        log(f"[TIME] Function {fn_cursor.spelling} processed in {fn_dt:.3f}s")
+        return result
     except Exception as e:
         print(f"[WARN] extract_node_info failed for {fn_cursor.spelling}: {e}")
         return None
@@ -1056,8 +1197,6 @@ def visit(
     if cursor.is_definition() and cursor.kind in (
         cindex.CursorKind.FUNCTION_DECL,
         cindex.CursorKind.CXX_METHOD,
-        cindex.CursorKind.CONSTRUCTOR,
-        cindex.CursorKind.DESTRUCTOR,
     ):
         visited.add(fqn)
         uid = node_uid(cursor)
@@ -1194,7 +1333,10 @@ def main():
     _GLOBAL_LABELER = BatchLLMLabeler(_GLOBAL_LLM, enabled=True)
 
     os.makedirs(_GLOBAL_OUT_DIR, exist_ok=True)
+    all_t0 = time.perf_counter()
     parse_codebase(args.path, compile_args=[f"-std={args.std}"])
+    all_dt = time.perf_counter() - all_t0
+    log(f"[TIME] Total execution time: {all_dt:.3f}s")
     print("Done.")
 
 
