@@ -59,7 +59,9 @@ def log(msg: str):
 
 # Labeling limits
 MAX_LABEL_CHARS = 180
-MAX_BLOCK_CHARS_FOR_NODE = 4000  # raw block text stored for batch LLM
+MAX_BLOCK_CHARS_FOR_NODE = 1200  # stored for debugging only (LLM prompt uses BASE_LABEL)
+LLM_CHUNK_CHAR_BUDGET = 6000     # keep batched prompts small for speed
+LLM_SKIP_LABEL_MAX_CHARS = 90    # if base label is already short/clean, skip LLM rewrite
 
 # Split long straight-line code into segments (avoid a single giant box)
 PENDING_SEGMENT_MAX_LINES = 35
@@ -584,9 +586,25 @@ class BatchLLMLabeler:
         if not blocks:
             return out
 
+        def needs_llm(base_label: str) -> bool:
+            """
+            LLM is only used to lightly rewrite labels for readability.
+            If the deterministic pseudo label is already short and clean,
+            we can skip the rewrite with no impact on correctness.
+            """
+            bl = clean_unicode_chars(base_label or "").strip()
+            if not bl:
+                return True
+            if len(bl) <= LLM_SKIP_LABEL_MAX_CHARS and "<br/>" not in bl and "..." not in bl:
+                return False
+            if bl.lower() in ("process block", "no operation"):
+                return True
+            return True
+
         remaining: list[tuple[str, str, str]] = []
         for bid, base_label, txt in blocks:
-            key = re.sub(r"\s+", " ", clean_unicode_chars(txt or "")).strip()
+            # Cache by base label (code can vary but pseudo label might repeat)
+            key = re.sub(r"\s+", " ", clean_unicode_chars(base_label or "")).strip()
             if key in self.cache:
                 out[bid] = self.cache[key]
             else:
@@ -607,7 +625,7 @@ class BatchLLMLabeler:
                 return
             mapping = self._invoke_chunk(chunk)
             for bid, base_label, txt in chunk:
-                key = re.sub(r"\s+", " ", clean_unicode_chars(txt or "")).strip()
+                key = re.sub(r"\s+", " ", clean_unicode_chars(base_label or "")).strip()
                 # If LLM fails for any block, keep deterministic base label.
                 lbl = mapping.get(bid) or base_label
                 lbl = clean_label_text(lbl)
@@ -617,11 +635,20 @@ class BatchLLMLabeler:
             chunk_chars = 0
 
         for bid, base_label, txt in remaining:
+            # Skip LLM for already-good labels (speed)
+            if not needs_llm(base_label):
+                lbl = clean_label_text(base_label)
+                out[bid] = lbl
+                key = re.sub(r"\s+", " ", clean_unicode_chars(base_label or "")).strip()
+                self.cache[key] = lbl
+                continue
+
+            # Keep code only for debugging/troubleshooting; do not include in prompt.
             t = clean_unicode_chars(txt or "")[:MAX_BLOCK_CHARS_FOR_NODE]
-            if chunk and (chunk_chars + len(t) > 9000):
+            if chunk and (chunk_chars + len(base_label) > LLM_CHUNK_CHAR_BUDGET):
                 flush_chunk()
             chunk.append((bid, base_label, t))
-            chunk_chars += len(t) + len(base_label)
+            chunk_chars += len(base_label)
 
         flush_chunk()
         return out
@@ -629,14 +656,16 @@ class BatchLLMLabeler:
     def _invoke_chunk(self, chunk: list[tuple[str, str, str]]) -> dict[str, str]:
         blocks_txt = []
         for bid, base_label, txt in chunk:
-            blocks_txt.append(f"### BLOCK {bid}\nBASE_LABEL:\n{base_label}\nCODE:\n{txt}\n")
+            # For performance, we only send the deterministic base label.
+            # Correctness comes from AST + pseudo label builder; LLM is for readability only.
+            blocks_txt.append(f"### BLOCK {bid}\nBASE_LABEL:\n{base_label}\n")
 
         prompt = (
             "You generate PROCESS-box labels for a C++ flowchart.\n"
             "Return STRICT JSON object mapping block ids to labels.\n"
             "Goal: do a *minimal* rewrite of BASE_LABEL so it reads cleanly (pseudo-code + tiny natural language if needed).\n"
             "Rules per label:\n"
-            "- must be based on BASE_LABEL; do NOT invent anything not present in CODE\n"
+            "- must be based on BASE_LABEL; do NOT invent anything\n"
             "- you may keep multiple lines by using literal '<br/>' (do NOT output real newlines)\n"
             "- keep assignments and calls; include call parameters\n"
             "- do NOT invent variables/conditions\n"
