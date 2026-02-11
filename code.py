@@ -128,7 +128,11 @@ def clamp_label(s: str) -> str:
     s = clean_unicode_chars(s or "")
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > MAX_LABEL_CHARS:
-        s = s[: MAX_LABEL_CHARS - 3].rstrip() + "..."
+        s = s[: MAX_LABEL_CHARS - 3].rstrip()
+        # Avoid leaving a dangling/incomplete Mermaid entity-code sequence like "#40"
+        # (entity codes are plain text here, but truncating mid-sequence harms readability).
+        s = re.sub(r"#\d{1,4}$", "", s).rstrip()
+        s = s + "..."
     return s
 
 
@@ -144,8 +148,9 @@ def _escape_mermaid_chars(text: str) -> str:
     br_placeholder = "__MERMAID_BR__"
     text = text.replace("<br>", "<br/>").replace("<br/>", br_placeholder)
 
-    # IMPORTANT: Do NOT escape ';' or ':' here.
-    # Entity codes themselves require ';' (e.g. #40;), and escaping ':' breaks `std::`.
+    # IMPORTANT:
+    # - Only escape bracket characters that Mermaid uses as node delimiters: () {} [].
+    # - Do NOT escape ';' or ':' here. Entity codes require ';', and ':' is needed for `std::`.
     esc = {
         "(": "#40;",
         ")": "#41;",
@@ -153,8 +158,6 @@ def _escape_mermaid_chars(text: str) -> str:
         "]": "#93;",
         "{": "#123;",
         "}": "#125;",
-        "<": "#60;",
-        ">": "#62;",
     }
     text = "".join(esc.get(ch, ch) for ch in text)
     return text.replace(br_placeholder, "<br/>")
@@ -233,87 +236,25 @@ def _simplify_decl_assign(stmt: str) -> str:
     return f"{m.group(1)} = {m.group(2).strip()}"
 
 
-def _extract_params(params_str: str) -> str:
+def _normalize_member_calls(text: str) -> str:
     """
-    Extract and simplify function parameters for display.
-    Removes complex expressions and keeps simple identifiers (best-effort).
-    """
-    if not params_str:
-        return ""
-    params_str = re.sub(r"\s+", " ", params_str).strip()
+    Normalize member-function calls into a Mermaid-friendly pseudo form:
 
-    params: list[str] = []
-    depth = 0
-    current: list[str] = []
-    for char in params_str:
-        if char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth = max(0, depth - 1)
-        elif char == "," and depth == 0:
-            p = "".join(current).strip()
-            if p:
-                params.append(p)
-            current = []
-            continue
-        current.append(char)
+      obj->Method(args)  ->  obj.<Method>(args)
+      obj.Method(args)   ->  obj.<Method>(args)
 
-    p = "".join(current).strip()
-    if p:
-        params.append(p)
-
-    simplified: list[str] = []
-    for param in params:
-        tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", param)
-        if tokens:
-            simplified.append(tokens[-1])
-        elif param and len(param) <= 15:
-            simplified.append(param)
-    return ", ".join(simplified[:4])
-
-
-def _replace_function_calls(text: str, for_condition: bool) -> str:
-    """
-    Replace function and method calls with a normalized representation including parameters.
-    (We do NOT remove parentheses; we escape them later for Mermaid.)
+    This avoids putting raw '->' into labels and keeps the exact parameter text.
+    We do NOT attempt to parse/modify nested calls or parameter expressions.
     """
     if not text:
         return text
 
-    def repl_method(match: re.Match) -> str:
-        obj = match.group(1)
-        accessor = match.group(2)
-        method = match.group(3)
-        params_raw = match.group(4)
-        if method in KEYWORD_TOKENS:
-            return f"{obj}{accessor}{method}"
-        params = _extract_params(params_raw)
-        return f"{obj}{accessor}{method}({params})"
-
-    def repl_fn(match: re.Match) -> str:
-        name = match.group(1)
-        params_raw = match.group(2)
-        if name in KEYWORD_TOKENS:
-            return name
-        params = _extract_params(params_raw)
-        return f"{name}({params})"
-
-    # normalize arrow first (keeps call parsing consistent)
-    text = text.replace("->", ".")
-
-    # Method calls first
-    text = re.sub(
-        r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*(\.)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)",
-        repl_method,
+    # Only rewrite when it's clearly a call (followed by '(').
+    return re.sub(
+        r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        r"\1.<\2>(",
         text,
     )
-    # Free function calls
-    text = re.sub(
-        r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(([^)]*)\)",
-        repl_fn,
-        text,
-    )
-    return text
 
 
 def _apply_nbsp_around_assignment_ops(label: str) -> str:
@@ -337,7 +278,9 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     label = clean_unicode_chars(label or "")
     label = label.replace("<br>", "<br/>")
 
-    label = _replace_function_calls(label, for_condition=for_condition)
+    # Keep labels close to the original pseudo-code (no "gist").
+    # Only normalize member calls for readability; do not drop/alter parameters.
+    label = _normalize_member_calls(label)
     label = label.replace("&&", " and ").replace("||", " or ")
 
     # Normalize whitespace but preserve <br/>
