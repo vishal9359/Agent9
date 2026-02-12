@@ -276,6 +276,96 @@ _PRESERVE_MEMBER_CONTEXT = {
 }
 
 
+# Populated per parsed file; used to add purpose hints for call sites.
+_GLOBAL_FN_PURPOSE: dict[str, str] = {}
+
+
+def _split_identifier_words(name: str) -> list[str]:
+    """
+    Split a C/C++ identifier into human-ish words.
+    Handles underscores and basic CamelCase.
+    """
+    name = clean_unicode_chars(name or "").strip()
+    if not name:
+        return []
+    parts = re.split(r"[_\s]+", name)
+    words: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        # Split camel case boundaries: FooBar -> Foo Bar, TRTRConfirm -> TRTR Confirm
+        w = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", p)
+        w = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", w)
+        words.extend([x for x in w.split() if x])
+    return words
+
+
+_VERB_WORDS = {
+    "get",
+    "set",
+    "update",
+    "identify",
+    "confirm",
+    "enqueue",
+    "dequeue",
+    "handle",
+    "process",
+    "compute",
+    "calculate",
+    "build",
+    "create",
+    "init",
+}
+
+
+def _humanize_function_purpose(fn_name: str) -> str:
+    """
+    Derive a short purpose phrase from a function name.
+    Example: TRTR_confirm_GetJCInfoTable -> Get JC Info Table
+    """
+    words = _split_identifier_words(fn_name)
+    if not words:
+        return ""
+    low = [w.lower() for w in words]
+    start_idx = 0
+    for i, w in enumerate(low):
+        if w in _VERB_WORDS:
+            start_idx = i
+            break
+    core = words[start_idx:]
+    if not core:
+        core = words
+    # Title-ish casing but preserve all-caps tokens
+    out = []
+    for w in core:
+        out.append(w if (w.isupper() and len(w) > 1) else w.capitalize())
+    return " ".join(out).strip()
+
+
+def _extract_first_comment_in_extent(file_lines: list[str], extent) -> str:
+    """
+    Extract the first inline comment inside a function extent, if present.
+    """
+    if not file_lines or not extent:
+        return ""
+    s = max(1, extent.start.line)
+    e = min(len(file_lines), extent.end.line)
+    # Search shortly after the signature
+    for i in range(s, min(e, s + 12)):
+        line = file_lines[i - 1].strip()
+        if not line:
+            continue
+        if line.startswith("//"):
+            txt = line[2:].strip()
+            return txt
+        if "/*" in line:
+            # best-effort: strip /* ... */
+            txt = re.sub(r"/\*+|\*+/|\*/", " ", line)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            return txt
+    return ""
+
+
 def _normalize_member_calls(text: str) -> str:
     """
     Normalize member-function calls into a Mermaid-friendly pseudo form:
@@ -324,6 +414,7 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     # Only normalize member calls for readability; do not drop/alter parameters.
     label = _normalize_member_calls(label)
     label = label.replace("&&", " and ").replace("||", " or ")
+    label = _replace_comparisons_with_words(label)
 
     # Normalize whitespace but preserve <br/>
     br = "__BR__"
@@ -334,6 +425,63 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     label = _escape_mermaid_chars(label)
 
     return clamp_label(label) or "Process block"
+
+
+_CMP_OP_WORDS = {
+    "==": "equals",
+    "!=": "not equal",
+    "<=": "less than or equal to",
+    ">=": "greater than or equal to",
+    "<": "less than",
+    ">": "greater than",
+}
+
+
+def _replace_comparisons_with_words(expr: str) -> str:
+    """
+    Replace comparison operators with words in a best-effort manner.
+    Also normalizes `A > B` into `B is less than A` (no '>' operator).
+    """
+    s = clean_unicode_chars(expr or "")
+    if not s:
+        return ""
+
+    # Work on a copy; avoid touching things like templates by requiring word-ish sides.
+    pat = re.compile(
+        r"(\b[A-Za-z_][A-Za-z0-9_:\.\[\]]*(?:\s*\([^)]*\))?)\s*(==|!=|>=|<=|>|<)\s*"
+        r"(\b[A-Za-z_][A-Za-z0-9_:\.\[\]]*(?:\s*\([^)]*\))?)"
+    )
+
+    def repl(m: re.Match) -> str:
+        left = m.group(1).strip()
+        op = m.group(2)
+        right = m.group(3).strip()
+        def looks_like_constant(x: str) -> bool:
+            x2 = re.sub(r"\s+", "", x)
+            return bool(re.fullmatch(r"[A-Z0-9_:\.]+", x2)) or bool(re.fullmatch(r"\d+", x2))
+
+        # Prefer keeping the variable-ish side first when comparing against constants
+        swap = looks_like_constant(left) and not looks_like_constant(right)
+
+        if op == ">":
+            return f"{right} is {_CMP_OP_WORDS['<']} {left}" if swap else f"{left} is {_CMP_OP_WORDS['>']} {right}"
+        if op == ">=":
+            return f"{right} is {_CMP_OP_WORDS['<=']} {left}" if swap else f"{left} is {_CMP_OP_WORDS['>=']} {right}"
+        if op == "<":
+            return f"{left} is {_CMP_OP_WORDS['<']} {right}"
+        if op == "<=":
+            return f"{left} is {_CMP_OP_WORDS['<=']} {right}"
+        if op == "==":
+            return f"{left} {_CMP_OP_WORDS['==']} {right}"
+        if op == "!=":
+            return f"{left} {_CMP_OP_WORDS['!=']} {right}"
+        return m.group(0)
+
+    prev = None
+    while prev != s:
+        prev = s
+        s = pat.sub(repl, s)
+    return s
 
 
 def clean_condition_text(label: str) -> str:
@@ -359,7 +507,21 @@ def clean_condition_text(label: str) -> str:
         if is_outer:
             label = label[1:-1].strip()
 
-    return clean_label_text(label, for_condition=True)
+    # Normalize member call display and boolean ops
+    label = _normalize_member_calls(label)
+    label = label.replace("&&", " and ").replace("||", " or ")
+
+    # Remove operator symbols (==, !=, <, >, <=, >=) in favor of words
+    label = _replace_comparisons_with_words(label)
+
+    # Whitespace normalize but preserve <br/>
+    br = "__BR__"
+    label = label.replace("<br/>", br)
+    label = re.sub(r"\s+", " ", label).strip()
+    label = label.replace(br, "<br/>")
+
+    label = _escape_mermaid_chars(label)
+    return clamp_label(label) or "condition"
 
 
 def extract_source_lines(file_lines: list[str], start_line: int, end_line: int) -> list[str]:
@@ -406,6 +568,39 @@ def cursor_text(cursor, file_lines: list[str]) -> str:
     if not cursor or not getattr(cursor, "extent", None):
         return ""
     return "\n".join(extract_source_lines(file_lines, cursor.extent.start.line, cursor.extent.end.line)).strip()
+
+
+def _function_def_snippet(fn_cursor, file_lines: list[str]) -> str:
+    """
+    Build a compact, LLM-friendly snippet for a function definition.
+    Used to infer the callee's purpose without generating its internal flowchart.
+    """
+    try:
+        if not fn_cursor or not getattr(fn_cursor, "extent", None):
+            return ""
+        name = getattr(fn_cursor, "spelling", "") or ""
+        if not name:
+            return ""
+        start = max(1, fn_cursor.extent.start.line)
+        end = min(len(file_lines), fn_cursor.extent.end.line)
+        lines = extract_source_lines(file_lines, start, end)
+        if not lines:
+            return ""
+
+        # Keep signature + a small window + first return statement
+        head = [l.rstrip() for l in lines[:50] if l.strip()]
+        snippet = "\n".join(head)
+
+        # Add the first return line if it appears later
+        if "return" not in snippet:
+            for l in lines:
+                if re.search(r"\breturn\b", l):
+                    snippet = snippet + "\n" + l.strip()
+                    break
+
+        return clean_unicode_chars(snippet).strip()
+    except Exception:
+        return ""
 
 
 def _extract_paren_group_after(keyword: str, text: str) -> str:
@@ -486,6 +681,45 @@ def _split_top_level_semicolons(s: str) -> list[str]:
     if tail:
         out.append(tail)
     return out
+
+
+def _describe_member_chain(expr: str) -> str:
+    """
+    Convert simple member/index chains into readable text.
+    Example: jcInfoTable->astInfoTable[ntr].next -> next of astInfoTable at index ntr of jcInfoTable
+    Best-effort; used mainly for loop bounds and pseudo labels.
+    """
+    s = clean_unicode_chars(expr or "").strip()
+    if not s:
+        return ""
+    s = s.replace("->", ".")
+    parts = [p for p in s.split(".") if p]
+    if not parts:
+        return s
+
+    def fmt_part(p: str) -> str:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^\]]+)\s*\]\s*$", p)
+        if m:
+            return f"{m.group(1)} at index {m.group(2).strip()}"
+        return p.strip()
+
+    chain = [fmt_part(p) for p in parts]
+    # Build "last of prev of base" wording
+    out = chain[-1]
+    for prev in reversed(chain[:-1]):
+        out = f"{out} of {prev}"
+    return out
+
+
+def _humanize_var(name: str) -> str:
+    words = _split_identifier_words(name)
+    if not words:
+        return name
+    # Lowercase first token if it looks like a prefix (e.g. trType -> tr type)
+    out = []
+    for w in words:
+        out.append(w.lower() if (len(w) <= 3 and w.isalpha()) else w)
+    return " ".join(out)
 
 _LAMBDA_DEF_RE = re.compile(
     r"(?s)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[[^\]]*\]\s*(?:\([^)]*\))?\s*\{"
@@ -637,6 +871,7 @@ def _simplify_pseudocode_statement(stmt: str) -> str:
             return s
         calls = _extract_call_expressions(rhs)
         if calls:
+            # Pseudo rule: show RHS call only; purpose wording is produced by LLM later.
             return calls[0]
         return s
 
@@ -704,6 +939,80 @@ class BatchLLMLabeler:
         self.llm = llm
         self.enabled = bool(enabled and llm and HumanMessage)
         self.cache: dict[str, str] = {}
+        # LLM-inferred purposes for called functions (by function name)
+        self.purpose_cache: dict[str, str] = {}
+
+    def _ensure_purposes(self, fn_names: list[str]) -> None:
+        """
+        Infer purpose phrases for functions using their definitions (snippets).
+        This lets us "look inside" a callee for understanding, but we do not
+        generate a flowchart for the callee's internals.
+        """
+        if not self.enabled:
+            return
+
+        todo = []
+        for nm in fn_names:
+            if not nm or nm in self.purpose_cache:
+                continue
+            snip = (_GLOBAL_FN_DEF_SNIPPET.get(nm) or "").strip()
+            if snip:
+                todo.append(nm)
+        if not todo:
+            return
+
+        chunk: list[str] = []
+        chars = 0
+
+        def flush():
+            nonlocal chunk, chars
+            if not chunk:
+                return
+
+            blocks = []
+            for nm in chunk:
+                snip = (_GLOBAL_FN_DEF_SNIPPET.get(nm) or "").strip()
+                snip_lines = [l.rstrip() for l in snip.splitlines() if l.strip()]
+                snip_short = "\n".join(snip_lines[:50])
+                blocks.append(f"### FUNCTION {nm}\n{snip_short}\n")
+
+            prompt = (
+                "You summarize C/C++ functions into short purpose phrases for flowchart labels.\n"
+                "Return STRICT JSON object mapping function names to purpose phrases.\n"
+                "Rules:\n"
+                "- 4-14 words\n"
+                "- prefer verbs like Get/Update/Identify/Confirm/Enqueue/Dequeue/Handle/Compute\n"
+                "- do NOT use operator symbols: == != > < <= >=\n"
+                "- do NOT invent details not supported by the snippet\n"
+                "\n"
+                f"{''.join(blocks)}\n"
+                "JSON:"
+            )
+            log("[LLM] Purpose prompt:\n" + prompt)
+            t0 = time.perf_counter()
+            resp = self.llm.invoke([HumanMessage(prompt)])
+            dt = time.perf_counter() - t0
+            log(f"[LLM] Purpose completed in {dt:.3f}s")
+            try:
+                data = json.loads((resp.content or "").strip())
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        kk = str(k).strip()
+                        vv = clean_unicode_chars(str(v)).strip()
+                        if kk and vv:
+                            self.purpose_cache[kk] = vv
+            except Exception:
+                pass
+
+            chunk = []
+            chars = 0
+
+        for nm in todo:
+            if chunk and (chars + len(nm) > 6500):
+                flush()
+            chunk.append(nm)
+            chars += len(nm)
+        flush()
 
     def label_many(self, blocks: list[tuple[str, str, str]]) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -738,6 +1047,15 @@ class BatchLLMLabeler:
             for bid, base_label, _txt in remaining:
                 out[bid] = clean_label_text(base_label)
             return out
+
+        # Use LLM to infer purposes for callees referenced in these labels.
+        called: set[str] = set()
+        for _bid, base_label, _txt in remaining:
+            for call in _extract_call_expressions(base_label or ""):
+                m = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", call)
+                if m:
+                    called.add(m.group(1))
+        self._ensure_purposes(sorted(called))
 
         # Chunk to keep prompts sane
         chunk: list[tuple[str, str, str]] = []
@@ -785,14 +1103,33 @@ class BatchLLMLabeler:
     def _invoke_chunk(self, chunk: list[tuple[str, str, str]]) -> dict[str, str]:
         blocks_txt = []
         for bid, base_label, txt in chunk:
-            # For performance, we only send the deterministic base label.
-            # Correctness comes from AST + pseudo label builder; LLM is for readability only.
-            blocks_txt.append(f"### BLOCK {bid}\nBASE_LABEL:\n{base_label}\n")
+            calls = _extract_call_expressions(base_label or "")
+            ctx_lines = []
+            for c in calls[:6]:
+                m = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", c)
+                if not m:
+                    continue
+                fn = m.group(1)
+                pur = (self.purpose_cache.get(fn) or "").strip()
+                if pur:
+                    ctx_lines.append(f"- {fn}: {pur}")
+            ctx = "\n".join(ctx_lines) if ctx_lines else "none"
+            blocks_txt.append(
+                f"### BLOCK {bid}\n"
+                f"BASE_LABEL:\n{base_label}\n"
+                f"CALLEE_PURPOSES:\n{ctx}\n"
+            )
 
         prompt = (
             "You generate PROCESS-box labels for a C++ flowchart.\n"
             "Return STRICT JSON object mapping block ids to labels.\n"
-            "Goal: do a *minimal* rewrite of BASE_LABEL so it reads cleanly (pseudo-code + tiny natural language if needed).\n"
+            "Goal: rewrite BASE_LABEL into the organization's flowchart language.\n"
+            "Use CALLEE_PURPOSES when present to describe what a call is doing.\n"
+            "Style examples:\n"
+            "- Get JC info table by calling TRTR_confirm_GetJCInfoTable()\n"
+            "- Update total pages by calling PTR_GetTotalTechnicalPagesPerTr() at input zone number\n"
+            "- Update next tr with next of ntr index of astInfoTable of jcInfoTable\n"
+            "- Update currentFastPageNum of pointer structure trtShared4YCon at index pcnt\n"
             "Rules per label:\n"
             "- must be based on BASE_LABEL; do NOT invent anything\n"
             "- you may keep multiple lines by using literal '<br/>' (do NOT output real newlines)\n"
@@ -800,6 +1137,7 @@ class BatchLLMLabeler:
             "- keep assignments and calls; include call parameters\n"
             "- do NOT invent variables/conditions\n"
             "- do NOT include control-flow keywords (if/for/while/switch/try/catch)\n"
+            "- do NOT use operator symbols: == != > < <= >= (use words: equals, not equal, less than, greater than, etc.)\n"
             "- keep <= 180 chars\n"
             "- separate statements with '<br/>' (not semicolons)\n"
             "- keep function calls as name(args) (do not drop parentheses)\n"
@@ -1065,7 +1403,7 @@ class FlowBuilder:
 
         cond_text = cursor_extent_text(cond, self.file_lines) or cursor_text(cond, self.file_lines) or "condition"
         cond_label = clean_condition_text(cond_text)
-        d = self.new_node("decision", f"check {cond_label}" if cond_label else "check condition")
+        d = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check condition")
 
         t_entry, t_exits = self.build_compound(then_stmt)
         self.add_edge(d, t_entry, "true")
@@ -1107,7 +1445,33 @@ class FlowBuilder:
         cond_text = (cond_text or cursor_text(cond, self.file_lines) or "loop condition").strip()
         cond_label = clean_condition_text(cond_text)
 
-        check = self.new_node("decision", f"check {cond_label}" if cond_label else "check loop condition")
+        # For-loop phrasing: "for all X less than Y" (no operators)
+        if k == cindex.CursorKind.FOR_STMT and inside and ";" in inside:
+            init_part = parts[0] if len(parts) > 0 else ""
+            cond_part = parts[1] if len(parts) > 1 else cond_text
+            vmatch = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=", init_part)
+            var = vmatch.group(1) if vmatch else ""
+            cm = re.search(r"\b([A-Za-z_][A-Za-z0-9_:\.\[\]]+)\s*(<|<=|>|>=)\s*([A-Za-z_][A-Za-z0-9_:\.\[\]]+)", cond_part)
+            if var and cm:
+                op = cm.group(2)
+                left = cm.group(1).strip()
+                right = cm.group(3).strip()
+                # Normalize direction: prefer "var less than bound"
+                bound = right
+                if op in (">", ">="):
+                    bound = left
+                bound_txt = _describe_member_chain(bound) or bound
+                vtxt = _humanize_var(var)
+                # simple pluralization for "types"/"indexes"
+                if not vtxt.endswith("s") and vtxt.lower().endswith("type"):
+                    vtxt = vtxt[:-4] + "types"
+                label_txt = f"for all {vtxt} less than {bound_txt}"
+                check = self.new_node("decision", label_txt)
+            else:
+                check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
+        else:
+            # while/do: use "Check ..." phrasing
+            check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
         after = self.new_node("process", "After loop")
 
         self.loop_stack.append((check, after))
@@ -1432,11 +1796,35 @@ def generate_word_document(data: list[dict], doc_name: str):
 def parse_file(index, file_path: str, root_dir: str, compile_args: list[str], out_nodes: dict, out_edges):
     module_name = get_module_name(file_path, root_dir)
     log(f"[INFO] Parsing file: {file_path}")
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            file_lines = f.readlines()
+    except Exception:
+        file_lines = []
     tu = index.parse(
         file_path,
         args=compile_args,
         options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
     )
+
+    # Build function definition snippets for LLM-based "purpose" inference.
+    # We do NOT generate callee flowcharts here; snippets are used only as context.
+    def _walk_defs(cur):
+        try:
+            if cur is None:
+                return
+            if cur.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD) and cur.is_definition():
+                nm = cur.spelling or ""
+                if nm and nm not in _GLOBAL_FN_DEF_SNIPPET:
+                    snip = _function_def_snippet(cur, file_lines)
+                    if snip:
+                        _GLOBAL_FN_DEF_SNIPPET[nm] = snip
+            for ch in cur.get_children():
+                _walk_defs(ch)
+        except Exception:
+            return
+
+    _walk_defs(tu.cursor)
 
     my_nodes: dict = {}
     my_edges = defaultdict(set)
@@ -1500,6 +1888,7 @@ _GLOBAL_MERMAID_DIR = DEFAULT_MERMAID_DIR
 _GLOBAL_LLM = None
 _GLOBAL_LABELER: BatchLLMLabeler = BatchLLMLabeler(None, enabled=False)
 _GLOBAL_NO_DESC = False
+_GLOBAL_FN_DEF_SNIPPET: dict[str, str] = {}
 
 
 def main():
