@@ -276,6 +276,96 @@ _PRESERVE_MEMBER_CONTEXT = {
 }
 
 
+# Populated per parsed file; used to add purpose hints for call sites.
+_GLOBAL_FN_PURPOSE: dict[str, str] = {}
+
+
+def _split_identifier_words(name: str) -> list[str]:
+    """
+    Split a C/C++ identifier into human-ish words.
+    Handles underscores and basic CamelCase.
+    """
+    name = clean_unicode_chars(name or "").strip()
+    if not name:
+        return []
+    parts = re.split(r"[_\s]+", name)
+    words: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        # Split camel case boundaries: FooBar -> Foo Bar, TRTRConfirm -> TRTR Confirm
+        w = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", p)
+        w = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", w)
+        words.extend([x for x in w.split() if x])
+    return words
+
+
+_VERB_WORDS = {
+    "get",
+    "set",
+    "update",
+    "identify",
+    "confirm",
+    "enqueue",
+    "dequeue",
+    "handle",
+    "process",
+    "compute",
+    "calculate",
+    "build",
+    "create",
+    "init",
+}
+
+
+def _humanize_function_purpose(fn_name: str) -> str:
+    """
+    Derive a short purpose phrase from a function name.
+    Example: TRTR_confirm_GetJCInfoTable -> Get JC Info Table
+    """
+    words = _split_identifier_words(fn_name)
+    if not words:
+        return ""
+    low = [w.lower() for w in words]
+    start_idx = 0
+    for i, w in enumerate(low):
+        if w in _VERB_WORDS:
+            start_idx = i
+            break
+    core = words[start_idx:]
+    if not core:
+        core = words
+    # Title-ish casing but preserve all-caps tokens
+    out = []
+    for w in core:
+        out.append(w if (w.isupper() and len(w) > 1) else w.capitalize())
+    return " ".join(out).strip()
+
+
+def _extract_first_comment_in_extent(file_lines: list[str], extent) -> str:
+    """
+    Extract the first inline comment inside a function extent, if present.
+    """
+    if not file_lines or not extent:
+        return ""
+    s = max(1, extent.start.line)
+    e = min(len(file_lines), extent.end.line)
+    # Search shortly after the signature
+    for i in range(s, min(e, s + 12)):
+        line = file_lines[i - 1].strip()
+        if not line:
+            continue
+        if line.startswith("//"):
+            txt = line[2:].strip()
+            return txt
+        if "/*" in line:
+            # best-effort: strip /* ... */
+            txt = re.sub(r"/\*+|\*+/|\*/", " ", line)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            return txt
+    return ""
+
+
 def _normalize_member_calls(text: str) -> str:
     """
     Normalize member-function calls into a Mermaid-friendly pseudo form:
@@ -336,6 +426,63 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     return clamp_label(label) or "Process block"
 
 
+_CMP_OP_WORDS = {
+    "==": "equals",
+    "!=": "not equal",
+    "<=": "less than or equal to",
+    ">=": "greater than or equal to",
+    "<": "less than",
+    ">": "greater than",
+}
+
+
+def _replace_comparisons_with_words(expr: str) -> str:
+    """
+    Replace comparison operators with words in a best-effort manner.
+    Also normalizes `A > B` into `B is less than A` (no '>' operator).
+    """
+    s = clean_unicode_chars(expr or "")
+    if not s:
+        return ""
+
+    # Work on a copy; avoid touching things like templates by requiring word-ish sides.
+    pat = re.compile(
+        r"(\b[A-Za-z_][A-Za-z0-9_:\.\[\]]*(?:\s*\([^)]*\))?)\s*(==|!=|>=|<=|>|<)\s*"
+        r"(\b[A-Za-z_][A-Za-z0-9_:\.\[\]]*(?:\s*\([^)]*\))?)"
+    )
+
+    def repl(m: re.Match) -> str:
+        left = m.group(1).strip()
+        op = m.group(2)
+        right = m.group(3).strip()
+        def looks_like_constant(x: str) -> bool:
+            x2 = re.sub(r"\s+", "", x)
+            return bool(re.fullmatch(r"[A-Z0-9_:\.]+", x2)) or bool(re.fullmatch(r"\d+", x2))
+
+        # Prefer keeping the variable-ish side first when comparing against constants
+        swap = looks_like_constant(left) and not looks_like_constant(right)
+
+        if op == ">":
+            return f"{right} is {_CMP_OP_WORDS['<']} {left}" if swap else f"{left} is {_CMP_OP_WORDS['>']} {right}"
+        if op == ">=":
+            return f"{right} is {_CMP_OP_WORDS['<=']} {left}" if swap else f"{left} is {_CMP_OP_WORDS['>=']} {right}"
+        if op == "<":
+            return f"{left} is {_CMP_OP_WORDS['<']} {right}"
+        if op == "<=":
+            return f"{left} is {_CMP_OP_WORDS['<=']} {right}"
+        if op == "==":
+            return f"{left} {_CMP_OP_WORDS['==']} {right}"
+        if op == "!=":
+            return f"{left} {_CMP_OP_WORDS['!=']} {right}"
+        return m.group(0)
+
+    prev = None
+    while prev != s:
+        prev = s
+        s = pat.sub(repl, s)
+    return s
+
+
 def clean_condition_text(label: str) -> str:
     """
     Clean condition expressions for decision nodes.
@@ -359,7 +506,21 @@ def clean_condition_text(label: str) -> str:
         if is_outer:
             label = label[1:-1].strip()
 
-    return clean_label_text(label, for_condition=True)
+    # Normalize member call display and boolean ops
+    label = _normalize_member_calls(label)
+    label = label.replace("&&", " and ").replace("||", " or ")
+
+    # Remove operator symbols (==, !=, <, >, <=, >=) in favor of words
+    label = _replace_comparisons_with_words(label)
+
+    # Whitespace normalize but preserve <br/>
+    br = "__BR__"
+    label = label.replace("<br/>", br)
+    label = re.sub(r"\s+", " ", label).strip()
+    label = label.replace(br, "<br/>")
+
+    label = _escape_mermaid_chars(label)
+    return clamp_label(label) or "condition"
 
 
 def extract_source_lines(file_lines: list[str], start_line: int, end_line: int) -> list[str]:
@@ -486,6 +647,45 @@ def _split_top_level_semicolons(s: str) -> list[str]:
     if tail:
         out.append(tail)
     return out
+
+
+def _describe_member_chain(expr: str) -> str:
+    """
+    Convert simple member/index chains into readable text.
+    Example: jcInfoTable->astInfoTable[ntr].next -> next of astInfoTable at index ntr of jcInfoTable
+    Best-effort; used mainly for loop bounds and pseudo labels.
+    """
+    s = clean_unicode_chars(expr or "").strip()
+    if not s:
+        return ""
+    s = s.replace("->", ".")
+    parts = [p for p in s.split(".") if p]
+    if not parts:
+        return s
+
+    def fmt_part(p: str) -> str:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^\]]+)\s*\]\s*$", p)
+        if m:
+            return f"{m.group(1)} at index {m.group(2).strip()}"
+        return p.strip()
+
+    chain = [fmt_part(p) for p in parts]
+    # Build "last of prev of base" wording
+    out = chain[-1]
+    for prev in reversed(chain[:-1]):
+        out = f"{out} of {prev}"
+    return out
+
+
+def _humanize_var(name: str) -> str:
+    words = _split_identifier_words(name)
+    if not words:
+        return name
+    # Lowercase first token if it looks like a prefix (e.g. trType -> tr type)
+    out = []
+    for w in words:
+        out.append(w.lower() if (len(w) <= 3 and w.isalpha()) else w)
+    return " ".join(out)
 
 _LAMBDA_DEF_RE = re.compile(
     r"(?s)\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[[^\]]*\]\s*(?:\([^)]*\))?\s*\{"
@@ -629,6 +829,7 @@ def _simplify_pseudocode_statement(stmt: str) -> str:
 
     m = _ASSIGN_RE.match(s)
     if m:
+        lhs = m.group(1).strip()
         rhs = m.group(2).strip()
         rhs = _normalize_member_calls(rhs)
         # If RHS is a member-context call like container.begin()/end()/size(),
@@ -637,7 +838,17 @@ def _simplify_pseudocode_statement(stmt: str) -> str:
             return s
         calls = _extract_call_expressions(rhs)
         if calls:
-            return calls[0]
+            call = calls[0]
+            cm = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\((.*)\)$", call)
+            if cm:
+                fn = cm.group(1)
+                args = cm.group(2).strip()
+                purpose = (_GLOBAL_FN_PURPOSE.get(fn) or "").strip()
+                if purpose:
+                    # Prefer purpose-driven English-ish pseudo text
+                    return f"{purpose} by calling {fn}({args})" if args else f"{purpose} by calling {fn}()"
+            # Fallback: keep call only (pseudo rule)
+            return call
         return s
 
     return s
@@ -664,6 +875,14 @@ def build_pseudocode_label(block_text: str) -> str:
         s2 = _simplify_decl_ctor(s2)
         s2 = _simplify_decl_assign(s2)
         s2 = _simplify_pseudocode_statement(s2)
+        # If it's a standalone call, expand into purpose-driven text if known.
+        cm = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\((.*)\)$", s2.strip())
+        if cm and " by calling " not in s2:
+            fn = cm.group(1)
+            args = cm.group(2).strip()
+            purpose = (_GLOBAL_FN_PURPOSE.get(fn) or "").strip()
+            if purpose:
+                s2 = f"{purpose} by calling {fn}({args})" if args else f"{purpose} by calling {fn}()"
         s2 = s2.strip()
         if s2:
             stmts.append(s2)
@@ -792,7 +1011,10 @@ class BatchLLMLabeler:
         prompt = (
             "You generate PROCESS-box labels for a C++ flowchart.\n"
             "Return STRICT JSON object mapping block ids to labels.\n"
-            "Goal: do a *minimal* rewrite of BASE_LABEL so it reads cleanly (pseudo-code + tiny natural language if needed).\n"
+            "Goal: rewrite BASE_LABEL into clear flowchart language (pseudo-code + small natural language), similar to:\n"
+            "- Get X by calling Foo()\n"
+            "- Update X with Y\n"
+            "- Update field of struct at index i\n"
             "Rules per label:\n"
             "- must be based on BASE_LABEL; do NOT invent anything\n"
             "- you may keep multiple lines by using literal '<br/>' (do NOT output real newlines)\n"
@@ -800,6 +1022,7 @@ class BatchLLMLabeler:
             "- keep assignments and calls; include call parameters\n"
             "- do NOT invent variables/conditions\n"
             "- do NOT include control-flow keywords (if/for/while/switch/try/catch)\n"
+            "- do NOT use operator symbols: == != > < <= >= (use words: equals, not equal, less than, greater than, etc.)\n"
             "- keep <= 180 chars\n"
             "- separate statements with '<br/>' (not semicolons)\n"
             "- keep function calls as name(args) (do not drop parentheses)\n"
@@ -1065,7 +1288,7 @@ class FlowBuilder:
 
         cond_text = cursor_extent_text(cond, self.file_lines) or cursor_text(cond, self.file_lines) or "condition"
         cond_label = clean_condition_text(cond_text)
-        d = self.new_node("decision", f"check {cond_label}" if cond_label else "check condition")
+        d = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check condition")
 
         t_entry, t_exits = self.build_compound(then_stmt)
         self.add_edge(d, t_entry, "true")
@@ -1107,7 +1330,33 @@ class FlowBuilder:
         cond_text = (cond_text or cursor_text(cond, self.file_lines) or "loop condition").strip()
         cond_label = clean_condition_text(cond_text)
 
-        check = self.new_node("decision", f"check {cond_label}" if cond_label else "check loop condition")
+        # For-loop phrasing: "for all X less than Y" (no operators)
+        if k == cindex.CursorKind.FOR_STMT and inside and ";" in inside:
+            init_part = parts[0] if len(parts) > 0 else ""
+            cond_part = parts[1] if len(parts) > 1 else cond_text
+            vmatch = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=", init_part)
+            var = vmatch.group(1) if vmatch else ""
+            cm = re.search(r"\b([A-Za-z_][A-Za-z0-9_:\.\[\]]+)\s*(<|<=|>|>=)\s*([A-Za-z_][A-Za-z0-9_:\.\[\]]+)", cond_part)
+            if var and cm:
+                op = cm.group(2)
+                left = cm.group(1).strip()
+                right = cm.group(3).strip()
+                # Normalize direction: prefer "var less than bound"
+                bound = right
+                if op in (">", ">="):
+                    bound = left
+                bound_txt = _describe_member_chain(bound) or bound
+                vtxt = _humanize_var(var)
+                # simple pluralization for "types"/"indexes"
+                if not vtxt.endswith("s") and vtxt.lower().endswith("type"):
+                    vtxt = vtxt[:-4] + "types"
+                label_txt = f"for all {vtxt} less than {bound_txt}"
+                check = self.new_node("decision", label_txt)
+            else:
+                check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
+        else:
+            # while/do: use "Check ..." phrasing
+            check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
         after = self.new_node("process", "After loop")
 
         self.loop_stack.append((check, after))
@@ -1432,11 +1681,46 @@ def generate_word_document(data: list[dict], doc_name: str):
 def parse_file(index, file_path: str, root_dir: str, compile_args: list[str], out_nodes: dict, out_edges):
     module_name = get_module_name(file_path, root_dir)
     log(f"[INFO] Parsing file: {file_path}")
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            file_lines = f.readlines()
+    except Exception:
+        file_lines = []
     tu = index.parse(
         file_path,
         args=compile_args,
         options=cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
     )
+
+    # Build callee purpose map for this file (used to enrich call labels without expanding callees)
+    def _purpose_for_cursor(cur) -> str:
+        name = getattr(cur, "spelling", "") or ""
+        if not name:
+            return ""
+        comment = _extract_first_comment_in_extent(file_lines, getattr(cur, "extent", None))
+        if comment:
+            # Normalize to a short phrase
+            c = re.sub(r"^\s*(to|for)\s+", "", comment, flags=re.IGNORECASE).strip()
+            c = re.sub(r"\s+", " ", c).strip()
+            if c:
+                # Capitalize first letter only
+                return c[:1].upper() + c[1:]
+        return _humanize_function_purpose(name)
+
+    def _walk(cur):
+        try:
+            if cur is None:
+                return
+            if cur.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD) and cur.is_definition():
+                nm = cur.spelling or ""
+                if nm and nm not in _GLOBAL_FN_PURPOSE:
+                    _GLOBAL_FN_PURPOSE[nm] = _purpose_for_cursor(cur)
+            for ch in cur.get_children():
+                _walk(ch)
+        except Exception:
+            return
+
+    _walk(tu.cursor)
 
     my_nodes: dict = {}
     my_edges = defaultdict(set)
