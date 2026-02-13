@@ -1075,6 +1075,9 @@ class BatchLLMLabeler:
                     lbl = base_label
                 else:
                     lbl = proposed
+                # If the label includes the standardized prefix, keep it; otherwise add [Process]
+                if not re.match(r"^\s*\[(Process|Decision)\]\s*", lbl):
+                    lbl = "[Process] " + (lbl or "").strip()
                 lbl = clean_label_text(lbl)
                 out[bid] = lbl
                 self.cache[key] = lbl
@@ -1121,28 +1124,43 @@ class BatchLLMLabeler:
             )
 
         prompt = (
-            "You generate PROCESS-box labels for a C++ flowchart.\n"
-            "Return STRICT JSON object mapping block ids to labels.\n"
-            "Goal: rewrite BASE_LABEL into the organization's flowchart language.\n"
-            "Use CALLEE_PURPOSES when present to describe what a call is doing.\n"
-            "Style examples:\n"
-            "- Get JC info table by calling TRTR_confirm_GetJCInfoTable()\n"
-            "- Update total pages by calling PTR_GetTotalTechnicalPagesPerTr() at input zone number\n"
-            "- Update next tr with next of ntr index of astInfoTable of jcInfoTable\n"
-            "- Update currentFastPageNum of pointer structure trtShared4YCon at index pcnt\n"
-            "Rules per label:\n"
-            "- must be based on BASE_LABEL; do NOT invent anything\n"
-            "- you may keep multiple lines by using literal '<br/>' (do NOT output real newlines)\n"
-            "- do NOT delete any statement line from BASE_LABEL; keep the same number of '<br/>' separated lines\n"
-            "- keep assignments and calls; include call parameters\n"
-            "- do NOT invent variables/conditions\n"
-            "- do NOT include control-flow keywords (if/for/while/switch/try/catch)\n"
-            "- do NOT use operator symbols: == != > < <= >= (use words: equals, not equal, less than, greater than, etc.)\n"
-            "- keep <= 180 chars\n"
-            "- separate statements with '<br/>' (not semicolons)\n"
-            "- keep function calls as name(args) (do not drop parentheses)\n"
+            "Convert the following C/C++ code statement into a short, flowchart-friendly English description.\n"
             "\n"
-            "Blocks:\n"
+            "STRICT RULES:\n"
+            "- Output must match flowchart style (Process or Decision)\n"
+            "- Do NOT explain logic or intent beyond what is visible in code\n"
+            "- Do NOT invent business meaning\n"
+            "- Use simple verbs only: Get, Update, Assign, Check, Iterate\n"
+            "- Mention function calls explicitly using \"by calling <function>()\"\n"
+            "- Mention structure, pointer, and index access explicitly\n"
+            "- Ignore implementation details of called functions unless parameters are visible\n"
+            "- Keep wording close to variable and function names\n"
+            "- No more than one sentence\n"
+            "- 8–15 words maximum\n"
+            "\n"
+            "LOOP RULES:\n"
+            "- for-loop -> \"For all <iterator> less than <condition>\"\n"
+            "- while-loop -> \"Check <condition>\"\n"
+            "\n"
+            "ASSIGNMENT RULES:\n"
+            "- LHS is destination\n"
+            "- RHS describes source\n"
+            "- Function call -> \"by calling <function>()\"\n"
+            "\n"
+            "OUTPUT FORMAT:\n"
+            "- Return STRICT JSON object mapping block ids to labels\n"
+            "- Each label MUST start with either:\n"
+            "  - [Process]\n"
+            "  - [Decision]\n"
+            "- If BASE_LABEL contains multiple statements separated by '<br/>',\n"
+            "  output the same number of lines separated by literal '<br/>' (no real newlines).\n"
+            "- Do NOT delete any statement line from BASE_LABEL\n"
+            "- Do NOT use operator symbols: == != > < <= >= (use words: equals, not equal, less than, greater than, etc.)\n"
+            "\n"
+            "Context:\n"
+            "- CALLEE_PURPOSES may be provided as hints; use only if consistent with BASE_LABEL.\n"
+            "\n"
+            "Code blocks:\n"
             f"{''.join(blocks_txt)}\n"
             "JSON:"
         )
