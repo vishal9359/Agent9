@@ -863,6 +863,7 @@ def _simplify_pseudocode_statement(stmt: str) -> str:
 
     m = _ASSIGN_RE.match(s)
     if m:
+        lhs = m.group(1).strip()
         rhs = m.group(2).strip()
         rhs = _normalize_member_calls(rhs)
         # If RHS is a member-context call like container.begin()/end()/size(),
@@ -871,8 +872,8 @@ def _simplify_pseudocode_statement(stmt: str) -> str:
             return s
         calls = _extract_call_expressions(rhs)
         if calls:
-            # Pseudo rule: show RHS call only; purpose wording is produced by LLM later.
-            return calls[0]
+            # Preserve assignment semantics for downstream LLM labeling.
+            return f"{lhs} = {calls[0]}"
         return s
 
     return s
@@ -1124,43 +1125,45 @@ class BatchLLMLabeler:
             )
 
         prompt = (
-            "Convert the following C/C++ code statement into a short, flowchart-friendly English description.\n"
-            "\n"
-            "STRICT RULES:\n"
-            "- Output must match flowchart style (Process or Decision)\n"
-            "- Do NOT explain logic or intent beyond what is visible in code\n"
-            "- Do NOT invent business meaning\n"
-            "- Use simple verbs only: Get, Update, Assign, Check, Iterate\n"
-            "- Mention function calls explicitly using \"by calling <function>()\"\n"
-            "- Mention structure, pointer, and index access explicitly\n"
-            "- Ignore implementation details of called functions unless parameters are visible\n"
-            "- Keep wording close to variable and function names\n"
-            "- No more than one sentence\n"
-            "- 8–15 words maximum\n"
-            "\n"
-            "LOOP RULES:\n"
-            "- for-loop -> \"For all <iterator> less than <condition>\"\n"
-            "- while-loop -> \"Check <condition>\"\n"
-            "\n"
-            "ASSIGNMENT RULES:\n"
-            "- LHS is destination\n"
-            "- RHS describes source\n"
-            "- Function call -> \"by calling <function>()\"\n"
-            "\n"
-            "OUTPUT FORMAT:\n"
-            "- Return STRICT JSON object mapping block ids to labels\n"
-            "- Each label MUST start with either:\n"
-            "  - [Process]\n"
-            "  - [Decision]\n"
-            "- If BASE_LABEL contains multiple statements separated by '<br/>',\n"
-            "  output the same number of lines separated by literal '<br/>' (no real newlines).\n"
-            "- Do NOT delete any statement line from BASE_LABEL\n"
-            "- Do NOT use operator symbols: == != > < <= >= (use words: equals, not equal, less than, greater than, etc.)\n"
-            "\n"
-            "Context:\n"
-            "- CALLEE_PURPOSES may be provided as hints; use only if consistent with BASE_LABEL.\n"
-            "\n"
-            "Code blocks:\n"
+            """
+Convert the following C/C++ code statement into a short, flowchart-friendly English label.
+
+You are rewriting AST-derived pseudo-code, NOT raw source code.
+
+STRICT RULES:
+- Output must be suitable for a flowchart node
+- Do NOT invent domain-specific or business meaning
+- Light semantic inference from function and variable names is ALLOWED
+- Preserve assignment direction and data flow
+- Use simple verbs only: Get, Update, Assign, Check, Iterate
+- Mention function calls explicitly using "by calling <function>()"
+- Mention structure, pointer, and index access explicitly
+- No more than one sentence
+- 8–18 words maximum
+
+STATEMENT TYPE RULES:
+- ASSIGNMENT:
+  - Mention destination first
+  - Describe source after "with" or "by calling"
+- FUNCTION_CALL:
+  - Describe action using function name
+- LOOP:
+  - Use quantifier form (For all / For each)
+- CONDITION:
+  - Use "Check ..."
+
+OUTPUT FORMAT:
+- Return STRICT JSON object mapping block ids to labels
+- Each label MUST start with:
+  - [Process] or [Decision]
+- Preserve "<br/>" line count exactly
+- Do NOT drop any statement line
+
+Do NOT use operator symbols: == != > < <= >=
+Use words instead.
+
+Code blocks:
+"""
             f"{''.join(blocks_txt)}\n"
             "JSON:"
         )
