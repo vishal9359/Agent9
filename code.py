@@ -688,7 +688,12 @@ def build_pseudocode_label(block_text: str) -> str:
         if len(calls) > 4:
             label += "<br/>..."
     else:
-        label = "<br/>".join(filtered[:6])
+        simplified: list[str] = []
+        for s in filtered[:6]:
+            s2 = _simplify_pseudocode_statement(s).strip()
+            if s2:
+                simplified.append(s2)
+        label = "<br/>".join(simplified)
         if len(filtered) > 6:
             label += "<br/>..."
     return clean_label_text(label)
@@ -784,10 +789,31 @@ class BatchLLMLabeler:
 
     def _invoke_chunk(self, chunk: list[tuple[str, str, str]]) -> dict[str, str]:
         blocks_txt = []
+
+        def infer_statement_type(base_label: str) -> str:
+            bl = clean_unicode_chars(base_label or "").strip()
+            if not bl:
+                return "FUNCTION_CALL"
+            # Prefer the first line/statement for classification.
+            first = bl.split("<br/>", 1)[0].strip()
+            s = first or bl
+            s_l = s.lower()
+
+            if re.search(r"\b(for each|after loop|loop|while|for)\b", s_l):
+                return "LOOP"
+            if s_l.startswith("check ") or re.search(r"(==|!=|>=|<=|<|>)", s):
+                return "CONDITION"
+            if re.search(r"(?<![=!<>])=(?![=])", s):
+                return "ASSIGNMENT"
+            if re.search(r"\b[A-Za-z_][A-Za-z0-9_:]*\s*\(", s):
+                return "FUNCTION_CALL"
+            return "FUNCTION_CALL"
+
         for bid, base_label, txt in chunk:
             # For performance, we only send the deterministic base label.
             # Correctness comes from AST + pseudo label builder; LLM is for readability only.
-            blocks_txt.append(f"### BLOCK {bid}\nBASE_LABEL:\n{base_label}\n")
+            stype = infer_statement_type(base_label)
+            blocks_txt.append(f"### BLOCK {bid}\nSTATEMENT_TYPE: {stype}\nBASE_LABEL:\n{base_label}\n")
 
         prompt = (
             "You generate PROCESS-box labels for a C++ flowchart.\n"
@@ -1231,12 +1257,35 @@ class FlowBuilder:
         return decision, [after]
 
 
+def _strip_internal_label_prefixes(label: str) -> str:
+    """
+    Strip internal control markers that should never appear in Mermaid labels.
+    Applied ONLY at Mermaid rendering time.
+    """
+    s = clean_unicode_chars(label or "").strip()
+    if not s:
+        return ""
+
+    # Unwrap wrappers like: [[Process; ...]] / [[Decision: ...]]
+    m = re.match(r"^\[\[\s*(process|decision)\s*[:;,\-]\s*(.*?)\s*\]\]\s*$", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return (m.group(2) or "").strip()
+
+    # Drop leading prefixes: [Process] / [Decision]
+    s = re.sub(r"^\[\s*(process|decision)\s*\]\s*", "", s, flags=re.IGNORECASE)
+    # Drop leading internal wrappers even if closing ']]' was lost upstream.
+    s = re.sub(r"^\[\[\s*(process|decision)\s*[:;,\-]\s*", "", s, flags=re.IGNORECASE)
+    # Drop trailing closing wrapper if present.
+    s = re.sub(r"\s*\]\]\s*$", "", s)
+    return s.strip()
+
+
 def render_mermaid(graph: Graph) -> str:
     lines = ["flowchart TD", "Start((Start))"]
 
     for nid, node in graph.nodes.items():
         shape = node["shape"]
-        label = clean_label_text(node["label"])
+        label = clean_label_text(_strip_internal_label_prefixes(node["label"])).replace("<br/>", "\n")
         if shape == "decision":
             lines.append(f"{nid}{{{{{label}}}}}")
         else:
