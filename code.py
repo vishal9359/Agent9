@@ -1034,8 +1034,9 @@ class BatchLLMLabeler:
             bl = clean_unicode_chars(base_label or "").strip()
             if not bl:
                 return True
-            # Force LLM rewrite for multi-statement labels (treat ';' as a separator).
-            if bl.count(";") > 1 or re.search(r"\S\s*;\s*\S", bl):
+            # Force LLM rewrite if this label originated from more than one statement
+            # or contains a call + assignment pattern.
+            if ";" in bl or re.search(r"\b=\s*[A-Za-z_][A-Za-z0-9_:]*\s*\(", bl):
                 return True
             if len(bl) <= LLM_SKIP_LABEL_MAX_CHARS and "<br/>" not in bl and "..." not in bl:
                 return False
