@@ -1034,6 +1034,9 @@ class BatchLLMLabeler:
             bl = clean_unicode_chars(base_label or "").strip()
             if not bl:
                 return True
+            # Force LLM rewrite for multi-statement labels (treat ';' as a separator).
+            if bl.count(";") > 1 or re.search(r"\S\s*;\s*\S", bl):
+                return True
             if len(bl) <= LLM_SKIP_LABEL_MAX_CHARS and "<br/>" not in bl and "..." not in bl:
                 return False
             if bl.lower() in ("process block", "no operation"):
@@ -1081,9 +1084,6 @@ class BatchLLMLabeler:
                     lbl = base_label
                 else:
                     lbl = proposed
-                # If the label includes the standardized prefix, keep it; otherwise add [Process]
-                if not re.match(r"^\s*\[(Process|Decision)\]\s*", lbl):
-                    lbl = "[Process] " + (lbl or "").strip()
                 lbl = clean_label_text(lbl)
                 out[bid] = lbl
                 self.cache[key] = lbl
