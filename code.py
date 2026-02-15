@@ -552,15 +552,19 @@ def clean_condition_text(label: str) -> str:
     label = label.replace("&&", " and ").replace("||", " or ")
 
     def _predicate_phrase(method: str) -> str:
-        # Known special cases for clearer wording
-        if method.lower() == "issyncmode":
-            return "in synchronous mode"
-        if method.lower() == "isexitqosset":
-            return "QoS exit flag is set"
-        # Generic: IsReady -> ready, IsValid -> valid
+        # Generic: IsReady -> ready, IsValid -> valid, IsSomethingMode -> in something mode, IsFlagSet -> flag is set
         core = re.sub(r"^Is", "", method).strip()
-        core_txt = _humanize_var(core) if core else method
-        return core_txt
+        if not core:
+            return method
+        words = _split_identifier_words(core)
+        low = [w.lower() for w in words]
+        if low and low[-1] == "mode":
+            head = " ".join(words[:-1]).strip() or core
+            return f"in {head} mode"
+        if low and low[-1] == "set":
+            head = " ".join(words[:-1]).strip() or core
+            return f"{head} is set"
+        return " ".join(words).strip() or core
 
     def _rewrite_predicate_comparisons(s: str) -> str:
         out = s
@@ -605,9 +609,7 @@ def clean_condition_text(label: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Common predicate helpers
-    label = re.sub(r"\b_?RateLimit\s*\([^)]*\)\s+is\s+true\b", "rate limit is reached", label, flags=re.IGNORECASE)
-    label = re.sub(r"\b_?RateLimit\s*\([^)]*\)\s+is\s+false\b", "rate limit is not reached", label, flags=re.IGNORECASE)
+    # (No hardcoded predicate helpers here; keep logic generic)
 
     # Whitespace normalize but preserve <br/>
     br = "__BR__"
@@ -1717,11 +1719,7 @@ class FlowBuilder:
                 check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
         else:
             # while/do: use "Check ..." phrasing
-            raw = clean_unicode_chars(cond_text or "").strip()
-            if re.fullmatch(r"!\s*IsExitQosSet\s*\(\s*\)\s*", raw):
-                check = self.new_node("decision", "Repeat while QoS exit flag is not set")
-            else:
-                check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
+            check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
         after = self.new_node("process", "After loop")
 
         self.loop_stack.append((check, after))
