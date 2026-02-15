@@ -327,10 +327,27 @@ def _humanize_function_purpose(fn_name: str) -> str:
     if not words:
         return ""
     low = [w.lower() for w in words]
+    # Prefer "get/update/identify/..." even if earlier tokens like "confirm" exist.
+    preferred = [
+        "get",
+        "update",
+        "identify",
+        "enqueue",
+        "dequeue",
+        "handle",
+        "compute",
+        "calculate",
+        "confirm",
+        "set",
+        "init",
+        "create",
+        "build",
+        "process",
+    ]
     start_idx = 0
-    for i, w in enumerate(low):
-        if w in _VERB_WORDS:
-            start_idx = i
+    for verb in preferred:
+        if verb in low:
+            start_idx = low.index(verb)
             break
     core = words[start_idx:]
     if not core:
@@ -382,7 +399,9 @@ def _normalize_member_calls(text: str) -> str:
     def repl(match: re.Match) -> str:
         obj = match.group(1)
         method = match.group(2)
-        if method in _PRESERVE_MEMBER_CONTEXT:
+        # Preserve object context for common getter/predicate patterns so conditions
+        # can be rewritten into readable English (e.g., ubio.IsSyncMode()).
+        if method in _PRESERVE_MEMBER_CONTEXT or re.match(r"^(Is|Get|Set|Has|Can|Do)[A-Z_]", method):
             return f"{obj}.{method}("
         return f"{method}("
 
@@ -458,10 +477,31 @@ def _replace_comparisons_with_words(expr: str) -> str:
         right = m.group(3).strip()
         def looks_like_constant(x: str) -> bool:
             x2 = re.sub(r"\s+", "", x)
-            return bool(re.fullmatch(r"[A-Z0-9_:\.]+", x2)) or bool(re.fullmatch(r"\d+", x2))
+            return (
+                bool(re.fullmatch(r"[A-Z0-9_:\.]+", x2))
+                or bool(re.fullmatch(r"\d+", x2))
+                or x2.lower() in ("true", "false", "nullptr", "null")
+            )
 
         # Prefer keeping the variable-ish side first when comparing against constants
         swap = looks_like_constant(left) and not looks_like_constant(right)
+        if swap and op in ("==", "!="):
+            left, right = right, left
+
+        rlow = right.lower().strip()
+        # Special-case unknown enum comparisons: event == BackendEvent_Unknown -> event is unknown
+        if op in ("==", "!=") and re.search(r"(?:^|_)unknown$", right, flags=re.IGNORECASE):
+            return f"{left} is {'not ' if op == '!=' else ''}unknown"
+
+        # Special-case null checks
+        if op in ("==", "!=") and rlow in ("nullptr", "null"):
+            return f"{left} is {'not ' if op == '!=' else ''}null"
+
+        # Special-case boolean literal comparisons
+        if op in ("==", "!=") and rlow in ("true", "false"):
+            want_true = (rlow == "true")
+            positive = (op == "==" and want_true) or (op == "!=" and not want_true)
+            return f"{left} is {'true' if positive else 'false'}"
 
         if op == ">":
             return f"{right} is {_CMP_OP_WORDS['<']} {left}" if swap else f"{left} is {_CMP_OP_WORDS['>']} {right}"
@@ -511,8 +551,63 @@ def clean_condition_text(label: str) -> str:
     label = _normalize_member_calls(label)
     label = label.replace("&&", " and ").replace("||", " or ")
 
+    def _predicate_phrase(method: str) -> str:
+        # Known special cases for clearer wording
+        if method.lower() == "issyncmode":
+            return "in synchronous mode"
+        if method.lower() == "isexitqosset":
+            return "QoS exit flag is set"
+        # Generic: IsReady -> ready, IsValid -> valid
+        core = re.sub(r"^Is", "", method).strip()
+        core_txt = _humanize_var(core) if core else method
+        return core_txt
+
+    def _rewrite_predicate_comparisons(s: str) -> str:
+        out = s
+        # obj.IsX() == true/false  ->  obj is (not) <phrase>
+        def repl_pred(m: re.Match) -> str:
+            obj = m.group(1)
+            method = m.group(2)
+            op = m.group(3)
+            lit = (m.group(4) or "").lower()
+            want_true = (lit == "true")
+            positive = (op == "==" and want_true) or (op == "!=" and not want_true)
+            phr = _predicate_phrase(method)
+            if phr.lower().endswith(" is set"):
+                return f"{obj} {phr}" if positive else f"{obj} {phr.replace(' is set', ' is not set')}"
+            return f"{obj} is {phr}" if positive else f"{obj} is not {phr}"
+
+        out = re.sub(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.(Is[A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(==|!=)\s*(true|false)\b",
+            repl_pred,
+            out,
+            flags=re.IGNORECASE,
+        )
+
+        # !Func(...) -> Func(...) == false (best-effort; keeps semantics in label text)
+        out = re.sub(
+            r"!\s*([A-Za-z_][A-Za-z0-9_:]*\s*\([^)]*\))",
+            r"\1 == false",
+            out,
+        )
+        return out
+
+    label = _rewrite_predicate_comparisons(label)
+
     # Remove operator symbols (==, !=, <, >, <=, >=) in favor of words
     label = _replace_comparisons_with_words(label)
+
+    # Best-effort natural language for common zero/pending patterns
+    label = re.sub(
+        r"\b([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])*)\s+equals\s+0\b",
+        lambda m: "no " + _humanize_var(re.sub(r"\[[^\]]+\]", "", m.group(1))) + " exists",
+        label,
+        flags=re.IGNORECASE,
+    )
+
+    # Common predicate helpers
+    label = re.sub(r"\b_?RateLimit\s*\([^)]*\)\s+is\s+true\b", "rate limit is reached", label, flags=re.IGNORECASE)
+    label = re.sub(r"\b_?RateLimit\s*\([^)]*\)\s+is\s+false\b", "rate limit is not reached", label, flags=re.IGNORECASE)
 
     # Whitespace normalize but preserve <br/>
     br = "__BR__"
@@ -1034,11 +1129,18 @@ class BatchLLMLabeler:
             bl = clean_unicode_chars(base_label or "").strip()
             if not bl:
                 return True
-            # Force LLM rewrite if this label originated from more than one statement
-            # or contains a call + assignment pattern.
-            if ";" in bl or re.search(r"\b=\s*[A-Za-z_][A-Za-z0-9_:]*\s*\(", bl):
+            # Force LLM rewrite for anything that still looks like raw pseudo-code.
+            if "<br/>" in bl:
                 return True
-            if len(bl) <= LLM_SKIP_LABEL_MAX_CHARS and "<br/>" not in bl and "..." not in bl:
+            if re.search(r"(;|\+\+|--|\breturn\b|(?<![=!<>])=(?![=])|\(|\[|\]|->|\.)", bl):
+                return True
+
+            # Skip LLM only for already-English short labels.
+            if len(bl) <= LLM_SKIP_LABEL_MAX_CHARS and "..." not in bl and re.match(
+                r"^(Get|Update|Initialize|Identify|Fetch|Store|Increase|Decrease|Submit|Notify|Enqueue|Dequeue|Assign|Check|Iterate|Exit)\b",
+                bl,
+                flags=re.IGNORECASE,
+            ):
                 return False
             if bl.lower() in ("process block", "no operation"):
                 return True
@@ -1132,9 +1234,99 @@ class BatchLLMLabeler:
                 return "FUNCTION_CALL"
             return "FUNCTION_CALL"
 
+        def _suggest_label_for_base_label(base_label: str, purpose_map: dict[str, str]) -> str:
+            """
+            Best-effort deterministic English suggestion to stabilize LLM output.
+            Keeps one statement per line (uses literal '<br/>' separators).
+            """
+            bl = clean_unicode_chars(base_label or "").strip()
+            if not bl:
+                return ""
+
+            def first_call_name(text: str) -> str:
+                m = re.search(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(", text or "")
+                return m.group(1) if m else ""
+
+            def suggest_one(stmt: str) -> str:
+                s = clean_unicode_chars(stmt or "").strip().rstrip(";")
+                if not s:
+                    return ""
+
+                if s == "return" or s.startswith("return "):
+                    return "Exit function"
+
+                # ++ / --
+                if s.endswith("++"):
+                    v = s[:-2].strip()
+                    v = re.sub(r"\[[^\]]+\]", "", v)
+                    return f"Increment {_humanize_var(v)}"
+                if s.endswith("--"):
+                    v = s[:-2].strip()
+                    v = re.sub(r"\[[^\]]+\]", "", v)
+                    return f"Decrease {_humanize_var(v)}"
+
+                m = _ASSIGN_RE.match(s)
+                if m:
+                    lhs = m.group(1).strip()
+                    rhs = m.group(2).strip()
+                    rhs = _normalize_member_calls(rhs)
+                    lhs_base = re.sub(r"\[[^\]]+\]", "", lhs).strip()
+                    lhs_desc = _humanize_var(lhs_base)
+                    # If LHS is a member/index target, describe it more explicitly.
+                    lhs_target = lhs_desc
+                    m_lhs = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)", lhs)
+                    if m_lhs:
+                        obj = m_lhs.group(1)
+                        acc = m_lhs.group(2)
+                        field = m_lhs.group(3)
+                        idxs = re.findall(r"\[([^\]]+)\]", lhs)
+                        lhs_target = f"{field} of {'pointer structure ' if acc == '->' else ''}{obj}".strip()
+                        if idxs:
+                            lhs_target += f" at index {idxs[0].strip()}"
+
+                    # init to 0/null
+                    if re.fullmatch(r"(?:0|0U|0u|NULL|nullptr)", rhs):
+                        if "null" in rhs.lower():
+                            return f"Initialize {lhs_target} to null"
+                        return f"Initialize {lhs_target} to zero"
+
+                    # x = x + y
+                    if re.match(rf"^{re.escape(lhs_base)}\s*\+\s*", rhs):
+                        y = re.sub(rf"^{re.escape(lhs_base)}\s*\+\s*", "", rhs).strip()
+                        return f"Increase {_humanize_var(lhs_base)} by {y}"
+
+                    # assignment from call
+                    fn = first_call_name(rhs)
+                    if fn:
+                        pur = (purpose_map.get(fn) or _humanize_function_purpose(fn) or "").strip()
+                        if pur:
+                            return f"{pur} by calling {rhs}"
+                        return f"Update {lhs_target} by calling {rhs}"
+
+                    # assignment from member/index chain
+                    if ("." in rhs) or ("[" in rhs):
+                        desc = _describe_member_chain(rhs) or rhs
+                        return f"Update {lhs_target} with {desc}"
+
+                    return f"Update {lhs_target}"
+
+                # plain call
+                fn = first_call_name(s)
+                if fn:
+                    pur = (purpose_map.get(fn) or _humanize_function_purpose(fn) or "").strip()
+                    return pur or f"Call {fn}"
+
+                return s
+
+            lines = [x.strip() for x in bl.split("<br/>") if x.strip()]
+            out_lines = [suggest_one(x) for x in lines]
+            out_lines = [x for x in out_lines if x]
+            return "<br/>".join(out_lines)
+
         for bid, base_label, txt in chunk:
             calls = _extract_call_expressions(base_label or "")
             ctx_lines = []
+            purpose_map: dict[str, str] = {}
             for c in calls[:6]:
                 m = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", c)
                 if not m:
@@ -1143,13 +1335,16 @@ class BatchLLMLabeler:
                 pur = (self.purpose_cache.get(fn) or "").strip()
                 if pur:
                     ctx_lines.append(f"- {fn}: {pur}")
+                    purpose_map[fn] = pur
             ctx = "\n".join(ctx_lines) if ctx_lines else "none"
             stype = infer_statement_type(base_label)
+            suggested = _suggest_label_for_base_label(base_label, purpose_map) or "none"
             blocks_txt.append(
                 f"### BLOCK {bid}\n"
                 f"STATEMENT_TYPE: {stype}\n"
                 f"BASE_LABEL:\n{base_label}\n"
                 f"CALLEE_PURPOSES:\n{ctx}\n"
+                f"SUGGESTED_LABEL:\n{suggested}\n"
             )
 
         prompt = (
@@ -1163,11 +1358,11 @@ STRICT RULES:
 - Do NOT invent domain-specific or business meaning
 - Light semantic inference from function and variable names is ALLOWED
 - Preserve assignment direction and data flow
-- Use simple verbs only: Get, Update, Assign, Check, Iterate
+- Use simple verbs only: Get, Update, Initialize, Identify, Fetch, Store, Increase, Decrease, Submit, Notify, Enqueue, Dequeue, Assign, Check, Iterate, Exit
 - Mention function calls explicitly using "by calling <function>()"
 - Mention structure, pointer, and index access explicitly
-- No more than one sentence
-- 8–18 words maximum
+- Each line should be one short sentence (multi-line uses literal '<br/>')
+- Keep each line <= 140 characters
 
 STATEMENT TYPE RULES:
 - ASSIGNMENT:
@@ -1182,10 +1377,12 @@ STATEMENT TYPE RULES:
 
 OUTPUT FORMAT:
 - Return STRICT JSON object mapping block ids to labels
-- Each label MUST start with:
-  - [Process] or [Decision]
 - Preserve "<br/>" line count exactly
 - Do NOT drop any statement line
+
+IMPORTANT:
+- If SUGGESTED_LABEL is not "none" and matches BASE_LABEL semantics, output it exactly.
+- If CALLEE_PURPOSES provides a purpose for a called function, prefer that phrasing.
 
 Do NOT use operator symbols: == != > < <= >=
 Use words instead.
@@ -1452,7 +1649,7 @@ class FlowBuilder:
 
         cond_text = cursor_extent_text(cond, self.file_lines) or cursor_text(cond, self.file_lines) or "condition"
         cond_label = clean_condition_text(cond_text)
-        d = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check condition")
+        d = self.new_node("decision", f"Check if {cond_label}" if cond_label else "Check condition")
 
         t_entry, t_exits = self.build_compound(then_stmt)
         self.add_edge(d, t_entry, "true")
@@ -1520,7 +1717,11 @@ class FlowBuilder:
                 check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
         else:
             # while/do: use "Check ..." phrasing
-            check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
+            raw = clean_unicode_chars(cond_text or "").strip()
+            if re.fullmatch(r"!\s*IsExitQosSet\s*\(\s*\)\s*", raw):
+                check = self.new_node("decision", "Repeat while QoS exit flag is not set")
+            else:
+                check = self.new_node("decision", f"Check {cond_label}" if cond_label else "Check loop condition")
         after = self.new_node("process", "After loop")
 
         self.loop_stack.append((check, after))
