@@ -130,14 +130,23 @@ def clean_unicode_chars(text: str) -> str:
 
 def clamp_label(s: str) -> str:
     s = clean_unicode_chars(s or "")
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) > MAX_LABEL_CHARS:
-        s = s[: MAX_LABEL_CHARS - 3].rstrip()
+    s = s.replace("<br>", "<br/>")
+
+    def clamp_part(p: str) -> str:
+        p = re.sub(r"\s+", " ", (p or "")).strip()
+        if len(p) <= MAX_LABEL_CHARS:
+            return p
+        p = p[: MAX_LABEL_CHARS - 3].rstrip()
         # Avoid leaving a dangling/incomplete Mermaid entity-code sequence like "#40"
-        # (entity codes are plain text here, but truncating mid-sequence harms readability).
-        s = re.sub(r"#\d{1,4}$", "", s).rstrip()
-        s = s + "..."
-    return s
+        p = re.sub(r"#\d{1,4}$", "", p).rstrip()
+        return p + "..."
+
+    if "<br/>" in s:
+        parts = s.split("<br/>")
+        parts = [clamp_part(p) for p in parts]
+        return "<br/>".join(parts).strip()
+
+    return clamp_part(s)
 
 
 def _escape_mermaid_chars(text: str) -> str:
@@ -165,6 +174,28 @@ def _escape_mermaid_chars(text: str) -> str:
     }
     text = "".join(esc.get(ch, ch) for ch in text)
     return text.replace(br_placeholder, "<br/>")
+
+
+def _unescape_mermaid_chars(text: str) -> str:
+    """
+    Best-effort inverse of _escape_mermaid_chars for internal processing/LLM prompts.
+    Converts `#40;` back to `(` etc. Leaves unknown sequences unchanged.
+    """
+    if not text:
+        return text
+    br_placeholder = "__MERMAID_BR__"
+    t = text.replace("<br>", "<br/>").replace("<br/>", br_placeholder)
+    unesc = {
+        "#40;": "(",
+        "#41;": ")",
+        "#91;": "[",
+        "#93;": "]",
+        "#123;": "{",
+        "#125;": "}",
+    }
+    for k, v in unesc.items():
+        t = t.replace(k, v)
+    return t.replace(br_placeholder, "<br/>")
 
 
 def _strip_comments(code: str) -> str:
@@ -1261,7 +1292,7 @@ class BatchLLMLabeler:
         # Use LLM to infer purposes for callees referenced in these labels.
         called: set[str] = set()
         for _bid, base_label, _txt in remaining:
-            for call in _extract_call_expressions(base_label or ""):
+            for call in _extract_call_expressions(_unescape_mermaid_chars(base_label or "")):
                 m = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", call)
                 if m:
                     called.add(m.group(1))
@@ -1278,9 +1309,10 @@ class BatchLLMLabeler:
             mapping = self._invoke_chunk(chunk)
             for bid, base_label, txt in chunk:
                 key = re.sub(r"\s+", " ", clean_unicode_chars(base_label or "")).strip()
+                base_label_dec = _unescape_mermaid_chars(base_label or "")
                 # Deterministic fallback suggestion (prevents reverting to raw pseudo-code).
                 pm: dict[str, str] = {}
-                for call in _extract_call_expressions(base_label or ""):
+                for call in _extract_call_expressions(base_label_dec or ""):
                     m = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", call)
                     if not m:
                         continue
@@ -1288,7 +1320,7 @@ class BatchLLMLabeler:
                     pur = (self.purpose_cache.get(fn) or "").strip()
                     if pur:
                         pm[fn] = pur
-                suggested = _suggest_label_for_base_label(base_label, pm)
+                suggested = _suggest_label_for_base_label(base_label_dec, pm)
 
                 proposed = mapping.get(bid) or suggested or base_label
 
@@ -1345,7 +1377,8 @@ class BatchLLMLabeler:
             return "FUNCTION_CALL"
 
         for bid, base_label, txt in chunk:
-            calls = _extract_call_expressions(base_label or "")
+            base_label_dec = _unescape_mermaid_chars(base_label or "")
+            calls = _extract_call_expressions(base_label_dec or "")
             ctx_lines = []
             purpose_map: dict[str, str] = {}
             for c in calls[:6]:
@@ -1358,12 +1391,12 @@ class BatchLLMLabeler:
                     ctx_lines.append(f"- {fn}: {pur}")
                     purpose_map[fn] = pur
             ctx = "\n".join(ctx_lines) if ctx_lines else "none"
-            stype = infer_statement_type(base_label)
-            suggested = _suggest_label_for_base_label(base_label, purpose_map) or "none"
+            stype = infer_statement_type(base_label_dec)
+            suggested = _suggest_label_for_base_label(base_label_dec, purpose_map) or "none"
             blocks_txt.append(
                 f"### BLOCK {bid}\n"
                 f"STATEMENT_TYPE: {stype}\n"
-                f"BASE_LABEL:\n{base_label}\n"
+                f"BASE_LABEL:\n{base_label_dec}\n"
                 f"CALLEE_PURPOSES:\n{ctx}\n"
                 f"SUGGESTED_LABEL:\n{suggested}\n"
             )
