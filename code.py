@@ -1295,6 +1295,11 @@ class BatchLLMLabeler:
                     # x = x + y
                     if re.match(rf"^{re.escape(lhs_base)}\s*\+\s*", rhs):
                         y = re.sub(rf"^{re.escape(lhs_base)}\s*\+\s*", "", rhs).strip()
+                        m_sz = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\.GetSize\s*\([^)]*\)\s*$", y)
+                        if m_sz:
+                            return f"Increase {_humanize_var(lhs_base)} by {m_sz.group(1)} size"
+                        if re.search(r"\bGetSize\s*\(", y):
+                            return f"Increase {_humanize_var(lhs_base)} by size"
                         return f"Increase {_humanize_var(lhs_base)} by {y}"
 
                     # assignment from call
@@ -1321,8 +1326,13 @@ class BatchLLMLabeler:
                 return s
 
             lines = [x.strip() for x in bl.split("<br/>") if x.strip()]
-            out_lines = [suggest_one(x) for x in lines]
-            out_lines = [x for x in out_lines if x]
+            out_lines: list[str] = []
+            for x in lines:
+                sug = (suggest_one(x) or "").strip()
+                if not sug:
+                    # Preserve line count; fall back to a compact cleaned statement.
+                    sug = re.sub(r"\s+", " ", clean_unicode_chars(x)).strip() or "Step"
+                out_lines.append(sug)
             return "<br/>".join(out_lines)
 
         for bid, base_label, txt in chunk:
