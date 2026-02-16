@@ -58,7 +58,7 @@ def log(msg: str):
 
 
 # Labeling limits
-MAX_LABEL_CHARS = 180
+MAX_LABEL_CHARS = 260
 MAX_BLOCK_CHARS_FOR_NODE = 1200  # stored for debugging only (LLM prompt uses BASE_LABEL)
 LLM_CHUNK_CHAR_BUDGET = 6000     # keep batched prompts small for speed
 LLM_SKIP_LABEL_MAX_CHARS = 90    # if base label is already short/clean, skip LLM rewrite
@@ -137,8 +137,8 @@ def clamp_label(s: str) -> str:
         if len(p) <= MAX_LABEL_CHARS:
             return p
         p = p[: MAX_LABEL_CHARS - 3].rstrip()
-        # Avoid leaving a dangling/incomplete Mermaid entity-code sequence like "#40"
-        p = re.sub(r"#\d{1,4}$", "", p).rstrip()
+        # Avoid leaving a dangling/incomplete Mermaid entity-code sequence like "#40;" cut to "#40"
+        p = re.sub(r"#\d{0,4}$", "", p).rstrip()
         return p + "..."
 
     if "<br/>" in s:
