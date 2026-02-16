@@ -1032,6 +1032,102 @@ def build_pseudocode_label(block_text: str) -> str:
     return clean_label_text(label)
 
 
+def _suggest_label_for_base_label(base_label: str, purpose_map: dict[str, str]) -> str:
+    """
+    Best-effort deterministic English suggestion to stabilize LLM output.
+    Keeps one statement per line (uses literal '<br/>' separators).
+    """
+    bl = clean_unicode_chars(base_label or "").strip()
+    if not bl:
+        return ""
+
+    def first_call_name(text: str) -> str:
+        m = re.search(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(", text or "")
+        return m.group(1) if m else ""
+
+    def suggest_one(stmt: str) -> str:
+        s = clean_unicode_chars(stmt or "").strip().rstrip(";")
+        if not s:
+            return ""
+
+        if s == "return" or s.startswith("return "):
+            return "Exit function"
+
+        # ++ / --
+        if s.endswith("++"):
+            v = re.sub(r"\[[^\]]+\]", "", s[:-2].strip())
+            return f"Increment {_humanize_var(v)}"
+        if s.endswith("--"):
+            v = re.sub(r"\[[^\]]+\]", "", s[:-2].strip())
+            return f"Decrease {_humanize_var(v)}"
+
+        m = _ASSIGN_RE.match(s)
+        if m:
+            lhs = m.group(1).strip()
+            rhs = _normalize_member_calls(m.group(2).strip())
+            lhs_base = re.sub(r"\[[^\]]+\]", "", lhs).strip()
+            lhs_target = _humanize_var(lhs_base)
+
+            m_lhs = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)", lhs)
+            if m_lhs:
+                obj = m_lhs.group(1)
+                acc = m_lhs.group(2)
+                field = m_lhs.group(3)
+                idxs = re.findall(r"\[([^\]]+)\]", lhs)
+                lhs_target = f"{field} of {'pointer structure ' if acc == '->' else ''}{obj}".strip()
+                if idxs:
+                    lhs_target += f" at index {idxs[0].strip()}"
+
+            # init to 0/null
+            if re.fullmatch(r"(?:0|0U|0u|NULL|nullptr)", rhs):
+                if "null" in rhs.lower():
+                    return f"Initialize {lhs_target} to null"
+                return f"Initialize {lhs_target} to zero"
+
+            # x = x + y
+            if re.match(rf"^{re.escape(lhs_base)}\s*\+\s*", rhs):
+                y = re.sub(rf"^{re.escape(lhs_base)}\s*\+\s*", "", rhs).strip()
+                m_sz = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\.GetSize\s*\([^)]*\)\s*$", y)
+                if m_sz:
+                    return f"Increase {_humanize_var(lhs_base)} by {m_sz.group(1)} size"
+                if re.search(r"\bGetSize\s*\(", y):
+                    return f"Increase {_humanize_var(lhs_base)} by size"
+                return f"Increase {_humanize_var(lhs_base)} by {y}"
+
+            # assignment from call
+            fn = first_call_name(rhs)
+            if fn:
+                pur = (purpose_map.get(fn) or _humanize_function_purpose(fn) or "").strip()
+                if pur:
+                    return f"{pur} by calling {rhs}"
+                return f"Update {lhs_target} by calling {rhs}"
+
+            # assignment from member/index chain
+            if ("." in rhs) or ("[" in rhs):
+                desc = _describe_member_chain(rhs) or rhs
+                return f"Update {lhs_target} with {desc}"
+
+            return f"Update {lhs_target}"
+
+        # plain call
+        fn = first_call_name(s)
+        if fn:
+            pur = (purpose_map.get(fn) or _humanize_function_purpose(fn) or "").strip()
+            return pur or f"Call {fn}"
+
+        return s
+
+    lines = [x.strip() for x in bl.split("<br/>") if x.strip()]
+    out_lines: list[str] = []
+    for x in lines:
+        sug = (suggest_one(x) or "").strip()
+        if not sug:
+            # Preserve line count; fall back to a compact cleaned statement.
+            sug = re.sub(r"\s+", " ", clean_unicode_chars(x)).strip() or "Step"
+        out_lines.append(sug)
+    return "<br/>".join(out_lines)
+
+
 class BatchLLMLabeler:
     """
     Optional batched LLM labeler that compresses/pretty-prints pseudo-code.
@@ -1182,11 +1278,23 @@ class BatchLLMLabeler:
             mapping = self._invoke_chunk(chunk)
             for bid, base_label, txt in chunk:
                 key = re.sub(r"\s+", " ", clean_unicode_chars(base_label or "")).strip()
-                # If LLM fails for any block, keep deterministic base label.
-                proposed = mapping.get(bid) or base_label
+                # Deterministic fallback suggestion (prevents reverting to raw pseudo-code).
+                pm: dict[str, str] = {}
+                for call in _extract_call_expressions(base_label or ""):
+                    m = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", call)
+                    if not m:
+                        continue
+                    fn = m.group(1)
+                    pur = (self.purpose_cache.get(fn) or "").strip()
+                    if pur:
+                        pm[fn] = pur
+                suggested = _suggest_label_for_base_label(base_label, pm)
+
+                proposed = mapping.get(bid) or suggested or base_label
+
                 # Guardrail: do not allow the LLM to drop statement lines.
                 if base_label.count("<br/>") and proposed.count("<br/>") < base_label.count("<br/>"):
-                    lbl = base_label
+                    lbl = suggested if suggested and suggested.count("<br/>") >= base_label.count("<br/>") else base_label
                 else:
                     lbl = proposed
                 lbl = clean_label_text(lbl)
@@ -1235,105 +1343,6 @@ class BatchLLMLabeler:
             if re.search(r"\b[A-Za-z_][A-Za-z0-9_:]*\s*\(", s):
                 return "FUNCTION_CALL"
             return "FUNCTION_CALL"
-
-        def _suggest_label_for_base_label(base_label: str, purpose_map: dict[str, str]) -> str:
-            """
-            Best-effort deterministic English suggestion to stabilize LLM output.
-            Keeps one statement per line (uses literal '<br/>' separators).
-            """
-            bl = clean_unicode_chars(base_label or "").strip()
-            if not bl:
-                return ""
-
-            def first_call_name(text: str) -> str:
-                m = re.search(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(", text or "")
-                return m.group(1) if m else ""
-
-            def suggest_one(stmt: str) -> str:
-                s = clean_unicode_chars(stmt or "").strip().rstrip(";")
-                if not s:
-                    return ""
-
-                if s == "return" or s.startswith("return "):
-                    return "Exit function"
-
-                # ++ / --
-                if s.endswith("++"):
-                    v = s[:-2].strip()
-                    v = re.sub(r"\[[^\]]+\]", "", v)
-                    return f"Increment {_humanize_var(v)}"
-                if s.endswith("--"):
-                    v = s[:-2].strip()
-                    v = re.sub(r"\[[^\]]+\]", "", v)
-                    return f"Decrease {_humanize_var(v)}"
-
-                m = _ASSIGN_RE.match(s)
-                if m:
-                    lhs = m.group(1).strip()
-                    rhs = m.group(2).strip()
-                    rhs = _normalize_member_calls(rhs)
-                    lhs_base = re.sub(r"\[[^\]]+\]", "", lhs).strip()
-                    lhs_desc = _humanize_var(lhs_base)
-                    # If LHS is a member/index target, describe it more explicitly.
-                    lhs_target = lhs_desc
-                    m_lhs = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)", lhs)
-                    if m_lhs:
-                        obj = m_lhs.group(1)
-                        acc = m_lhs.group(2)
-                        field = m_lhs.group(3)
-                        idxs = re.findall(r"\[([^\]]+)\]", lhs)
-                        lhs_target = f"{field} of {'pointer structure ' if acc == '->' else ''}{obj}".strip()
-                        if idxs:
-                            lhs_target += f" at index {idxs[0].strip()}"
-
-                    # init to 0/null
-                    if re.fullmatch(r"(?:0|0U|0u|NULL|nullptr)", rhs):
-                        if "null" in rhs.lower():
-                            return f"Initialize {lhs_target} to null"
-                        return f"Initialize {lhs_target} to zero"
-
-                    # x = x + y
-                    if re.match(rf"^{re.escape(lhs_base)}\s*\+\s*", rhs):
-                        y = re.sub(rf"^{re.escape(lhs_base)}\s*\+\s*", "", rhs).strip()
-                        m_sz = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\.GetSize\s*\([^)]*\)\s*$", y)
-                        if m_sz:
-                            return f"Increase {_humanize_var(lhs_base)} by {m_sz.group(1)} size"
-                        if re.search(r"\bGetSize\s*\(", y):
-                            return f"Increase {_humanize_var(lhs_base)} by size"
-                        return f"Increase {_humanize_var(lhs_base)} by {y}"
-
-                    # assignment from call
-                    fn = first_call_name(rhs)
-                    if fn:
-                        pur = (purpose_map.get(fn) or _humanize_function_purpose(fn) or "").strip()
-                        if pur:
-                            return f"{pur} by calling {rhs}"
-                        return f"Update {lhs_target} by calling {rhs}"
-
-                    # assignment from member/index chain
-                    if ("." in rhs) or ("[" in rhs):
-                        desc = _describe_member_chain(rhs) or rhs
-                        return f"Update {lhs_target} with {desc}"
-
-                    return f"Update {lhs_target}"
-
-                # plain call
-                fn = first_call_name(s)
-                if fn:
-                    pur = (purpose_map.get(fn) or _humanize_function_purpose(fn) or "").strip()
-                    return pur or f"Call {fn}"
-
-                return s
-
-            lines = [x.strip() for x in bl.split("<br/>") if x.strip()]
-            out_lines: list[str] = []
-            for x in lines:
-                sug = (suggest_one(x) or "").strip()
-                if not sug:
-                    # Preserve line count; fall back to a compact cleaned statement.
-                    sug = re.sub(r"\s+", " ", clean_unicode_chars(x)).strip() or "Step"
-                out_lines.append(sug)
-            return "<br/>".join(out_lines)
 
         for bid, base_label, txt in chunk:
             calls = _extract_call_expressions(base_label or "")
