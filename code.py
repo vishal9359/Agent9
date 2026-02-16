@@ -428,6 +428,8 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     """
     label = clean_unicode_chars(label or "")
     label = label.replace("<br>", "<br/>")
+    br = "__BR__"
+    label = label.replace("<br/>", br)
 
     # Keep labels close to the original pseudo-code (no "gist").
     # Only normalize member calls for readability; do not drop/alter parameters.
@@ -436,8 +438,6 @@ def clean_label_text(label: str, for_condition: bool = False) -> str:
     label = _replace_comparisons_with_words(label)
 
     # Normalize whitespace but preserve <br/>
-    br = "__BR__"
-    label = label.replace("<br/>", br)
     label = re.sub(r"\s+", " ", label).strip()
     label = label.replace(br, "<br/>")
 
@@ -531,6 +531,8 @@ def clean_condition_text(label: str) -> str:
     """
     label = clean_unicode_chars(label or "")
     label = re.sub(r"^\s*(if|for|while|switch)\b", "", label, flags=re.IGNORECASE).strip()
+    br = "__BR__"
+    label = label.replace("<br/>", br)
 
     label = label.strip()
     if label.startswith("(") and label.endswith(")"):
@@ -612,8 +614,6 @@ def clean_condition_text(label: str) -> str:
     # (No hardcoded predicate helpers here; keep logic generic)
 
     # Whitespace normalize but preserve <br/>
-    br = "__BR__"
-    label = label.replace("<br/>", br)
     label = re.sub(r"\s+", " ", label).strip()
     label = label.replace(br, "<br/>")
 
